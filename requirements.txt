@@ -1,0 +1,44 @@
+# Telegram Bot
+aiogram==3.13.1
+aiohttp==3.10.5
+aiocache==0.12.2
+
+# Database
+sqlalchemy==2.0.35
+asyncpg==0.29.0
+alembic==1.13.3
+psycopg2-binary==2.9.9
+
+# Web Scraping
+beautifulsoup4==4.12.3
+lxml==5.3.0
+playwright==1.48.0
+
+# Utilities
+python-dotenv==1.0.1
+pydantic==2.9.2
+pydantic-settings==2.5.2
+
+# Redis (caching)
+redis==5.1.1
+aioredis==2.0.1
+
+# Image processing
+Pillow==10.4.0
+
+# Logging & Monitoring
+structlog==24.4.0
+python-json-logger==2.0.7
+
+# Data validation
+phonenumbers==8.13.47
+
+# Task scheduling
+apscheduler==3.10.4
+
+# Development
+pytest==8.3.3
+pytest-asyncio==0.24.0
+black==24.10.0
+flake8==7.1.1
+mypy==1.13.0
