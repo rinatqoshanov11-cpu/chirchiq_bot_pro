@@ -90,6 +90,11 @@ class Settings(BaseSettings):
         port = os.environ.get("PORT")
         if port and port.isdigit():
             self.webapp_port = int(port)
+        # Render sets RENDER_EXTERNAL_URL to the service's public https address:
+        # always trust it over a hand-typed WEBAPP_URL
+        external = (os.environ.get("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+        if external.startswith("https://"):
+            self.webapp_url = external
         return self
 
     @property
