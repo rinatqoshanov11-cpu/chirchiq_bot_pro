@@ -53,6 +53,8 @@ class Apartment(Base):
     # Location
     address: Mapped[str] = mapped_column(Text, nullable=False)
     district: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    latitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    longitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     # Pricing
     price: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)

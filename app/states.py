@@ -14,12 +14,16 @@ class ApartmentStates(StatesGroup):
     waiting_for_type = State()
     waiting_for_rooms = State()
     waiting_for_address = State()
+    waiting_for_address_detail = State()
+    waiting_for_location = State()
     waiting_for_price = State()
     waiting_for_area = State()
     waiting_for_floor = State()
+    waiting_for_total_floors = State()
     waiting_for_description = State()
     waiting_for_photos = State()
     confirm_apartment = State()
+    choosing_edit_field = State()
 
 
 class AdminStates(StatesGroup):

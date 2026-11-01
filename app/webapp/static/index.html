@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="uz">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="format-detection" content="telephone=no">
+  <title>Chirchiq Kvartira</title>
+  <!-- Telegram Web App SDK: self-hosted copy, because telegram.org is unreachable on some networks -->
+  <script src="/static/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="app" class="app">
+
+    <!-- ===== Catalog ===== -->
+    <section id="view-catalog" class="view" data-view="catalog">
+      <header class="topbar">
+        <div class="topbar-row">
+          <h1 class="topbar-title">Chirchiq Kvartira</h1>
+        </div>
+        <div class="segmented" id="type-segment" role="tablist" aria-label="E'lon turi" data-i18n-aria="seg.label">
+          <button type="button" class="segmented-btn is-active" data-type="all" role="tab" aria-selected="true" data-i18n="seg.all">Hammasi</button>
+          <button type="button" class="segmented-btn" data-type="rent" role="tab" aria-selected="false" data-i18n="seg.rent">Ijaraga</button>
+          <button type="button" class="segmented-btn" data-type="sale" role="tab" aria-selected="false" data-i18n="seg.sale">Sotuv</button>
+        </div>
+        <div class="toolbar">
+          <button type="button" class="chip chip-filter" id="filter-btn" aria-haspopup="dialog">
+            <svg class="chip-icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M3 5h18v2l-7 7v5l-4 2v-7L3 7V5z"/></svg>
+            <span data-i18n="filter.button">Filtr</span>
+            <span class="chip-badge" id="filter-count" hidden>0</span>
+          </button>
+          <span class="result-count" id="result-count" aria-live="polite"></span>
+        </div>
+      </header>
+
+      <div class="list" id="catalog-list"></div>
+      <div class="load-more" id="catalog-more" hidden>
+        <button type="button" class="btn btn-secondary" id="catalog-more-btn" data-i18n="catalog.more">Yana ko'rsatish</button>
+      </div>
+      <div id="catalog-sentinel" class="sentinel" aria-hidden="true"></div>
+    </section>
+
+    <!-- ===== My listings ===== -->
+    <section id="view-my" class="view" data-view="my" hidden>
+      <header class="topbar">
+        <div class="topbar-row">
+          <h1 class="topbar-title" data-i18n="my.title">Mening e'lonlarim</h1>
+          <button type="button" class="icon-btn" id="my-refresh" aria-label="Yangilash" title="Yangilash" data-i18n-aria="my.refresh" data-i18n-title="my.refresh">
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M17.65 6.35A7.96 7.96 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+          </button>
+        </div>
+      </header>
+      <div class="list" id="my-list"></div>
+    </section>
+
+    <!-- ===== Tab bar ===== -->
+    <nav class="tabbar" id="tabbar" aria-label="Bo'limlar" data-i18n-aria="tabs.label">
+      <button type="button" class="tab is-active" data-tab="catalog" aria-selected="true">
+        <span class="tab-icon" aria-hidden="true">🏠</span>
+        <span class="tab-label" data-i18n="tabs.catalog">E'lonlar</span>
+      </button>
+      <button type="button" class="tab" data-tab="my" aria-selected="false">
+        <span class="tab-icon" aria-hidden="true">📋</span>
+        <span class="tab-label" data-i18n="tabs.my">Mening e'lonlarim</span>
+      </button>
+    </nav>
+  </div>
+
+  <!-- ===== Detail overlay ===== -->
+  <div id="detail" class="detail" role="dialog" aria-modal="true" aria-label="E'lon" data-i18n-aria="detail.label" hidden>
+    <button type="button" class="detail-close icon-btn" id="detail-close" aria-label="Yopish" data-i18n-aria="common.close">
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
+    </button>
+    <div class="detail-scroll" id="detail-scroll"></div>
+    <div class="detail-bar" id="detail-bar"></div>
+  </div>
+
+  <!-- ===== Bottom sheet ===== -->
+  <div id="sheet" class="sheet" hidden>
+    <div class="sheet-backdrop" id="sheet-backdrop"></div>
+    <div class="sheet-panel" role="dialog" aria-modal="true" id="sheet-panel">
+      <div class="sheet-handle" aria-hidden="true"></div>
+      <div class="sheet-head">
+        <h2 class="sheet-title" id="sheet-title"></h2>
+        <button type="button" class="icon-btn" id="sheet-close" aria-label="Yopish" data-i18n-aria="common.close">
+          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M18.3 5.71 12 12l6.3 6.29-1.41 1.42L10.59 13.4 4.29 19.71 2.88 18.3 9.17 12 2.88 5.71 4.29 4.29l6.3 6.3 6.3-6.3z"/></svg>
+        </button>
+      </div>
+      <div class="sheet-body" id="sheet-body"></div>
+    </div>
+  </div>
+
+  <!-- ===== Toast ===== -->
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden>
+    <span class="toast-text" id="toast-text"></span>
+    <button type="button" class="toast-action" id="toast-action" data-i18n="toast.retry" hidden>Qayta</button>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

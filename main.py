@@ -2,7 +2,7 @@
 import asyncio
 import sys
 from aiogram import Bot, Dispatcher
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -10,24 +10,31 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from config import settings
 from app.models.base import init_db, close_db, async_session_maker
 from app.handlers import (
+    language_router,
     registration_router,
     common_router,
     apartments_router,
-    admin_router
+    admin_router,
+    fallback_router
 )
-from app.middlewares import DatabaseMiddleware, LoggingMiddleware
+from app.middlewares import DatabaseMiddleware, LanguageMiddleware, LoggingMiddleware
 from app.utils import setup_logging, get_logger
+from app.utils.bot_profile import setup_bot_profile
+from app.webapp.server import start_webapp, stop_webapp
 
 # Setup logging
 setup_logging()
 logger = get_logger(__name__)
 
 
-async def on_startup():
+async def on_startup(bot: Bot):
     """Execute on bot startup."""
     logger.info("Initializing database...")
     await init_db()
     logger.info("Database initialized successfully")
+
+    # Bot name, descriptions, command menu, avatar (never raises)
+    await setup_bot_profile(bot)
 
 
 async def on_shutdown():
@@ -81,19 +88,25 @@ async def main():
     )
 
     storage = MemoryStorage()
-    dp = Dispatcher(storage=storage)
+    # One update at a time per user: stops double-taps from saving a listing twice
+    dp = Dispatcher(storage=storage, events_isolation=SimpleEventIsolation())
 
     # Register middlewares
     dp.message.middleware(DatabaseMiddleware())
     dp.callback_query.middleware(DatabaseMiddleware())
+    # data['lang'] / data['lang_chosen'] (needs data['session'] -> after DatabaseMiddleware)
+    dp.message.middleware(LanguageMiddleware())
+    dp.callback_query.middleware(LanguageMiddleware())
     dp.message.middleware(LoggingMiddleware())
     dp.callback_query.middleware(LoggingMiddleware())
 
     # Register routers
+    dp.include_router(language_router)  # must stay first (language picker on the first /start)
     dp.include_router(registration_router)
     dp.include_router(common_router)
     dp.include_router(apartments_router)
     dp.include_router(admin_router)
+    dp.include_router(fallback_router)  # must stay last
 
     # Setup startup/shutdown handlers
     dp.startup.register(on_startup)
@@ -101,6 +114,13 @@ async def main():
 
     # Setup scheduler
     scheduler = await setup_scheduler(bot)
+
+    # Mini app web server (same process); a busy port never stops the bot
+    webapp_runner = None
+    if settings.webapp_enabled:
+        webapp_runner = await start_webapp(bot)
+    else:
+        logger.info("Mini app web server is disabled")
 
     try:
         logger.info("Bot started successfully! Press Ctrl+C to stop.")
@@ -113,6 +133,8 @@ async def main():
     finally:
         if scheduler:
             scheduler.shutdown()
+        if webapp_runner:
+            await stop_webapp(webapp_runner)
         await bot.session.close()
 
 

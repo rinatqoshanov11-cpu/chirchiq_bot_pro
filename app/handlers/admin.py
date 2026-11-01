@@ -1,9 +1,11 @@
 """Admin handlers."""
 from aiogram import Router, F
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.states import AdminStates
 
 from app.services import UserService, ApartmentService
 from app.keyboards import InlineKeyboards, MainKeyboard
@@ -341,15 +343,9 @@ async def admin_broadcast_prompt(callback: CallbackQuery, session: AsyncSession,
     await callback.answer()
 
 
-@router.message(F.text, F.from_user.func(lambda u: True))
+@router.message(StateFilter(AdminStates.waiting_for_broadcast_message), F.text)
 async def process_broadcast_message(message: Message, state: FSMContext, session: AsyncSession):
-    """Process broadcast message."""
-    from app.states import AdminStates
-
-    current_state = await state.get_state()
-    if current_state != AdminStates.waiting_for_broadcast_message:
-        return
-
+    """Process broadcast message (only while the admin is writing one)."""
     if not await UserService.is_admin(session, message.from_user.id):
         return
 

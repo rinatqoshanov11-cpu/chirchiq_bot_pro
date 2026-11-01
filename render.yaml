@@ -1,0 +1,38 @@
+# Render.com blueprint: one free web service that runs the bot (polling) + the mini app server.
+# The mini app listens on $PORT, which keeps the free web service "alive" and gives the HTTPS URL.
+services:
+  - type: web
+    name: chirchiq-kvartira-bot
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.13.7"
+      - key: WEBAPP_HOST
+        value: "0.0.0.0"
+      - key: WEBAPP_ENABLED
+        value: "True"
+      - key: SCRAPER_ENABLED
+        value: "False"
+      - key: DEBUG
+        value: "False"
+      - key: DB_ECHO
+        value: "False"
+      - key: LOG_LEVEL
+        value: "INFO"
+      # Filled in the Render dashboard (secrets are never committed):
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: WEBAPP_URL
+        sync: false

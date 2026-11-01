@@ -47,3 +47,10 @@ build/
 
 # Local notes with real secrets (token, DB password) - never commit
 SETUP_HISTORY.md
+assets/.avatar_set
+
+# Mini app photo cache (downloaded from Telegram)
+cache/
+
+# Server environment values with secrets (copy into the hosting dashboard) - never commit
+render_env.txt

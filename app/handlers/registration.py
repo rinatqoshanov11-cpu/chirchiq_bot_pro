@@ -1,50 +1,93 @@
-"""Registration handlers."""
-from aiogram import Router, F
+"""Registration handlers (and the /start welcome)."""
+from html import escape
+
+from aiogram import Bot, Router, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message, ReplyKeyboardRemove
+from aiogram.types import Message, ReplyKeyboardRemove, User as TgUser
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.i18n import t, variants, is_text
 from app.states import RegistrationStates
-from app.services import UserService
-from app.keyboards import MainKeyboard
+from app.services import UserService, ApartmentService
+from app.keyboards import MainKeyboard, InlineKeyboards
 from app.utils import validate_phone_number, get_logger
 
 logger = get_logger(__name__)
 router = Router()
 
+BRAND = "Chirchiq Kvartira"
 
-@router.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext, session: AsyncSession):
-    """Handle /start command."""
-    telegram_id = message.from_user.id
-    await state.clear()
 
-    # Check if user is already registered
-    user = await UserService.get_by_telegram_id(session, telegram_id)
+def _format_count(value: int) -> str:
+    """Format a number with a space as thousands separator: 12345 -> '12 345'."""
+    return f"{value:,}".replace(",", " ")
 
-    if user and user.is_registered:
-        await message.answer(
-            f"👋 Xush kelibsiz, {user.full_name}!\n\n"
-            "🏠 Chirchiq shahri kvartira ijarasi va sotish boti.\n\n"
-            "📱 Kvartiralarni ko'rish uchun 'Kvartira qidirish' tugmasini bosing.\n"
-            "➕ E'lon qo'shish uchun 'E'lon qo'shish' tugmasini bosing.",
-            reply_markup=MainKeyboard.get_main_menu(is_registered=True)
-        )
-        return
 
-    # Show main menu without registration
-    await message.answer(
-        "👋 Xush kelibsiz!\n\n"
-        "🏠 Chirchiq shahri kvartira ijarasi va sotish boti.\n\n"
-        "📱 Kvartiralarni darhol ko'rishingiz mumkin - 'Kvartira qidirish' tugmasini bosing.\n\n"
-        "➕ E'lon qo'shmoqchi bo'lsangiz, avval 'Ro'yxatdan o'tish' tugmasini bosing.",
-        reply_markup=MainKeyboard.get_main_menu(is_registered=False)
+async def _active_listings_line(session: AsyncSession, lang: str) -> str:
+    """Return a line with the live number of active listings, or '' on error / zero."""
+    try:
+        count = await ApartmentService.count_search(session)
+    except Exception as e:
+        logger.warning(f"Could not count active listings for /start: {e}")
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        return ""
+
+    if not count:
+        return ""
+    return t(lang, "start.listings_count", count=_format_count(count)) + "\n\n"
+
+
+async def send_welcome(bot: Bot, chat_id: int, from_user: TgUser, session: AsyncSession, lang: str) -> None:
+    """The /start welcome: greeting + live listings count + main menu, then the inline 'open app' button.
+
+    Also called by app/handlers/language.py right after the user picks a language.
+    """
+    # Count first: on error it rolls back, which would expire an already loaded user
+    listings_line = await _active_listings_line(session, lang)
+
+    user = await UserService.get_by_telegram_id(session, from_user.id)
+    is_registered = bool(user and user.is_registered)
+    about = t(lang, "start.about", brand=BRAND)
+
+    if is_registered:
+        name = escape(user.full_name or from_user.first_name or "")
+        greeting = t(lang, "start.greet_name", name=name)
+        body = t(lang, "start.body_registered")
+    else:
+        first_name = escape(from_user.first_name or "")
+        greeting = t(lang, "start.greet_name", name=first_name) if first_name else t(lang, "start.greet")
+        body = t(lang, "start.body_guest")
+
+    await bot.send_message(
+        chat_id,
+        f"{greeting}\n\n{about}\n\n{listings_line}{body}",
+        reply_markup=MainKeyboard.get_main_menu(is_registered=is_registered, lang=lang),
     )
 
+    # Inline 'open app' button (inline buttons pass the user's identity to the app)
+    keyboard = InlineKeyboards.get_open_app(lang, t(lang, "btn.view_listings"))
+    if keyboard:
+        await bot.send_message(chat_id, t(lang, "start.open_app_hint"), reply_markup=keyboard)
 
-@router.message(F.text == "📝 Ro'yxatdan o'tish")
-async def start_registration(message: Message, state: FSMContext, session: AsyncSession):
+
+@router.message(Command("start"))
+async def cmd_start(message: Message, state: FSMContext, session: AsyncSession, bot: Bot, lang: str = "uz"):
+    """Handle /start command."""
+    await state.clear()
+    await send_welcome(bot, message.chat.id, message.from_user, session, lang)
+
+
+async def _cancel(message: Message, state: FSMContext, lang: str) -> None:
+    await state.clear()
+    await message.answer(t(lang, "reg.cancelled"), reply_markup=ReplyKeyboardRemove())
+
+
+@router.message(F.text.in_(variants("btn.register")))
+async def start_registration(message: Message, state: FSMContext, session: AsyncSession, lang: str = "uz"):
     """Start registration process."""
     telegram_id = message.from_user.id
 
@@ -52,114 +95,97 @@ async def start_registration(message: Message, state: FSMContext, session: Async
     user = await UserService.get_by_telegram_id(session, telegram_id)
     if user and user.is_registered:
         await message.answer(
-            "✅ Siz allaqachon ro'yxatdan o'tgansiz!",
-            reply_markup=MainKeyboard.get_main_menu(is_registered=True)
+            t(lang, "reg.already", add=t(lang, "btn.add_listing")),
+            reply_markup=MainKeyboard.get_main_menu(is_registered=True, lang=lang)
         )
         return
 
     await message.answer(
-        "📝 Ro'yxatdan o'tish jarayoni boshlanadi.\n\n"
-        "Ism-familiyangizni kiriting:",
-        reply_markup=MainKeyboard.get_cancel_keyboard()
+        t(lang, "reg.start", cancel=t(lang, "btn.cancel")),
+        reply_markup=MainKeyboard.get_cancel_keyboard(lang)
     )
     await state.set_state(RegistrationStates.waiting_for_full_name)
 
 
 @router.message(RegistrationStates.waiting_for_full_name)
-async def process_full_name(message: Message, state: FSMContext):
+async def process_full_name(message: Message, state: FSMContext, lang: str = "uz"):
     """Process full name input."""
-    if message.text == "❌ Bekor qilish":
-        await state.clear()
-        await message.answer(
-            "❌ Ro'yxatdan o'tish bekor qilindi.\n"
-            "Qaytadan boshlash uchun /start ni bosing.",
-            reply_markup=ReplyKeyboardRemove()
-        )
+    if is_text(message.text, "btn.cancel"):
+        await _cancel(message, state, lang)
         return
 
     if not message.text or len(message.text) < 3:
-        await message.answer("❌ Iltimos, to'liq ism-familiyangizni kiriting (kamida 3 ta harf):")
+        await message.answer(t(lang, "reg.name_short"))
         return
 
     await state.update_data(full_name=message.text.strip())
     await message.answer(
-        "📱 Telefon raqamingizni kiriting yoki tugmani bosing:\n"
-        "(Masalan: +998901234567)",
-        reply_markup=MainKeyboard.get_phone_keyboard()
+        t(lang, "reg.phone_prompt", send_phone=t(lang, "btn.send_phone")),
+        reply_markup=MainKeyboard.get_phone_keyboard(lang)
     )
     await state.set_state(RegistrationStates.waiting_for_phone)
 
 
+async def _ask_address(message: Message, state: FSMContext, lang: str) -> None:
+    await message.answer(t(lang, "reg.address_prompt"), reply_markup=MainKeyboard.get_cancel_keyboard(lang))
+    await state.set_state(RegistrationStates.waiting_for_address)
+
+
 @router.message(RegistrationStates.waiting_for_phone, F.contact)
-async def process_phone_contact(message: Message, state: FSMContext):
+async def process_phone_contact(message: Message, state: FSMContext, lang: str = "uz"):
     """Process phone number from contact."""
     phone = message.contact.phone_number
     validated_phone = validate_phone_number(phone)
 
     if not validated_phone:
         await message.answer(
-            "❌ Noto'g'ri telefon raqam. Iltimos, qaytadan kiriting:",
-            reply_markup=MainKeyboard.get_phone_keyboard()
+            t(lang, "reg.phone_contact_invalid"),
+            reply_markup=MainKeyboard.get_phone_keyboard(lang)
         )
         return
 
     await state.update_data(phone_number=validated_phone)
-    await message.answer(
-        "📍 Manzilingizni kiriting:\n"
-        "(Masalan: Chirchiq shahar, Mustaqillik ko'chasi, 25-uy)",
-        reply_markup=MainKeyboard.get_cancel_keyboard()
-    )
-    await state.set_state(RegistrationStates.waiting_for_address)
+    await _ask_address(message, state, lang)
 
 
 @router.message(RegistrationStates.waiting_for_phone)
-async def process_phone_text(message: Message, state: FSMContext):
+async def process_phone_text(message: Message, state: FSMContext, lang: str = "uz"):
     """Process phone number from text."""
-    if message.text == "❌ Bekor qilish":
-        await state.clear()
-        await message.answer(
-            "❌ Ro'yxatdan o'tish bekor qilindi.",
-            reply_markup=ReplyKeyboardRemove()
-        )
+    if is_text(message.text, "btn.cancel"):
+        await _cancel(message, state, lang)
         return
 
+    send_phone = t(lang, "btn.send_phone")
+
     if not message.text:
-        await message.answer("❌ Iltimos, telefon raqamingizni kiriting:")
+        await message.answer(
+            t(lang, "reg.phone_not_text", send_phone=send_phone),
+            reply_markup=MainKeyboard.get_phone_keyboard(lang)
+        )
         return
 
     validated_phone = validate_phone_number(message.text)
 
     if not validated_phone:
         await message.answer(
-            "❌ Noto'g'ri telefon raqam formati.\n"
-            "To'g'ri format: +998901234567 yoki 998901234567\n\n"
-            "Qaytadan kiriting:",
-            reply_markup=MainKeyboard.get_phone_keyboard()
+            t(lang, "reg.phone_invalid", send_phone=send_phone),
+            reply_markup=MainKeyboard.get_phone_keyboard(lang)
         )
         return
 
     await state.update_data(phone_number=validated_phone)
-    await message.answer(
-        "📍 Manzilingizni kiriting:\n"
-        "(Masalan: Chirchiq shahar, Mustaqillik ko'chasi, 25-uy)",
-        reply_markup=MainKeyboard.get_cancel_keyboard()
-    )
-    await state.set_state(RegistrationStates.waiting_for_address)
+    await _ask_address(message, state, lang)
 
 
 @router.message(RegistrationStates.waiting_for_address)
-async def process_address(message: Message, state: FSMContext, session: AsyncSession):
+async def process_address(message: Message, state: FSMContext, session: AsyncSession, lang: str = "uz"):
     """Process address and complete registration."""
-    if message.text == "❌ Bekor qilish":
-        await state.clear()
-        await message.answer(
-            "❌ Ro'yxatdan o'tish bekor qilindi.",
-            reply_markup=ReplyKeyboardRemove()
-        )
+    if is_text(message.text, "btn.cancel"):
+        await _cancel(message, state, lang)
         return
 
     if not message.text or len(message.text) < 5:
-        await message.answer("❌ Iltimos, to'liq manzilingizni kiriting (kamida 5 ta harf):")
+        await message.answer(t(lang, "reg.address_short"))
         return
 
     # Get all registration data
@@ -179,21 +205,18 @@ async def process_address(message: Message, state: FSMContext, session: AsyncSes
         await state.clear()
 
         await message.answer(
-            f"✅ Ro'yxatdan o'tish muvaffaqiyatli yakunlandi!\n\n"
-            f"👤 Ism: {user.full_name}\n"
-            f"📱 Telefon: {user.phone_number}\n"
-            f"📍 Manzil: {user.address}\n\n"
-            f"Endi siz e'lon qo'shishingiz va barcha imkoniyatlardan foydalanishingiz mumkin!",
-            reply_markup=MainKeyboard.get_main_menu(is_registered=True)
+            t(
+                lang, "reg.success",
+                name=escape(user.full_name or ''),
+                phone=escape(user.phone_number or ''),
+                address=escape(user.address or ''),
+            ),
+            reply_markup=MainKeyboard.get_main_menu(is_registered=True, lang=lang)
         )
 
         logger.info(f"New user registered: {user.telegram_id} - {user.full_name}")
 
     except Exception as e:
         logger.error(f"Registration error: {e}")
-        await message.answer(
-            "❌ Ro'yxatdan o'tishda xatolik yuz berdi. Iltimos, qaytadan urinib ko'ring.\n"
-            "/start ni bosing.",
-            reply_markup=ReplyKeyboardRemove()
-        )
+        await message.answer(t(lang, "reg.error"), reply_markup=ReplyKeyboardRemove())
         await state.clear()
