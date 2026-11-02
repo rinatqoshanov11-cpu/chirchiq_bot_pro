@@ -16,7 +16,7 @@ class User(Base):
     username: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     full_name: Mapped[str] = mapped_column(String(255), nullable=False)
     phone_number: Mapped[str] = mapped_column(String(20), nullable=False)
-    address: Mapped[str] = mapped_column(Text, nullable=False)
+    address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_registered: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

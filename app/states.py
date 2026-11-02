@@ -6,7 +6,6 @@ class RegistrationStates(StatesGroup):
     """Registration flow states."""
     waiting_for_full_name = State()
     waiting_for_phone = State()
-    waiting_for_address = State()
 
 
 class ApartmentStates(StatesGroup):

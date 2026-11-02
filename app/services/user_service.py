@@ -31,7 +31,7 @@ class UserService:
         telegram_id: int,
         full_name: str,
         phone_number: str,
-        address: str,
+        address: Optional[str] = None,
         username: Optional[str] = None,
     ) -> User:
         """Create new user."""

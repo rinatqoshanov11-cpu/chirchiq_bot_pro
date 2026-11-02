@@ -314,7 +314,8 @@ def format_user_info(user, lang: str = "uz") -> str:
     if user.username:
         lines.append(_t(lang, "settings.profile_username", value=_esc_short(user.username, 64)))
     lines.append(_t(lang, "settings.profile_phone", value=_esc_short(user.phone_number, 30)))
-    lines.append(_t(lang, "settings.profile_address", value=_esc_short(user.address, 200)))
+    if user.address:
+        lines.append(_t(lang, "settings.profile_address", value=_esc_short(user.address, 200)))
 
     lines.append("")
     lines.append(_t(lang, "settings.profile_id", value=_esc(user.telegram_id)))

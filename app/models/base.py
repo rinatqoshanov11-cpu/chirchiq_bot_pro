@@ -42,6 +42,8 @@ async def init_db():
         from sqlalchemy import text
         await conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION"))
         await conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION"))
+        # Registration no longer asks for a home address
+        await conn.execute(text("ALTER TABLE users ALTER COLUMN address DROP NOT NULL"))
 
 
 async def close_db():

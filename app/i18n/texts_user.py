@@ -87,24 +87,24 @@ TEXTS = {
     "reg.start": {
         "uz": (
             "📝 <b>Ro'yxatdan o'tish</b>\n"
-            "Atigi 3 ta qisqa qadam — ism, telefon va manzil.\n\n"
-            "👤 <b>1/3-qadam: Ism-familiya</b>\n\n"
+            "Atigi 2 ta qisqa qadam — ism va telefon.\n\n"
+            "👤 <b>1/2-qadam: Ism-familiya</b>\n\n"
             "Ism-familiyangizni yozing.\n\n"
             "✏️ Masalan: <i>Aliyev Jasur</i>\n\n"
             "❌ To'xtatish uchun «{cancel}» tugmasini bosing."
         ),
         "ru": (
             "📝 <b>Регистрация</b>\n"
-            "Всего 3 коротких шага — имя, телефон и адрес.\n\n"
-            "👤 <b>Шаг 1/3: Имя и фамилия</b>\n\n"
+            "Всего 2 коротких шага — имя и телефон.\n\n"
+            "👤 <b>Шаг 1/2: Имя и фамилия</b>\n\n"
             "Напишите ваши имя и фамилию.\n\n"
             "✏️ Например: <i>Алиев Жасур</i>\n\n"
             "❌ Чтобы прервать, нажмите «{cancel}»."
         ),
         "en": (
             "📝 <b>Registration</b>\n"
-            "Just 3 short steps — name, phone and address.\n\n"
-            "👤 <b>Step 1/3: Full name</b>\n\n"
+            "Just 2 short steps — name and phone.\n\n"
+            "👤 <b>Step 1/2: Full name</b>\n\n"
             "Type your first and last name.\n\n"
             "✏️ Example: <i>Jasur Aliyev</i>\n\n"
             "❌ To stop, tap «{cancel}»."
@@ -129,19 +129,19 @@ TEXTS = {
     },
     "reg.phone_prompt": {
         "uz": (
-            "📱 <b>2/3-qadam: Telefon raqam</b>\n\n"
+            "📱 <b>2/2-qadam: Telefon raqam</b>\n\n"
             "Pastdagi «{send_phone}» tugmasini bosing "
             "yoki raqamni qo'lda yozing.\n\n"
             "✏️ Masalan: <code>+998901234567</code>"
         ),
         "ru": (
-            "📱 <b>Шаг 2/3: Номер телефона</b>\n\n"
+            "📱 <b>Шаг 2/2: Номер телефона</b>\n\n"
             "Нажмите кнопку «{send_phone}» внизу "
             "или введите номер вручную.\n\n"
             "✏️ Например: <code>+998901234567</code>"
         ),
         "en": (
-            "📱 <b>Step 2/3: Phone number</b>\n\n"
+            "📱 <b>Step 2/2: Phone number</b>\n\n"
             "Tap the «{send_phone}» button below "
             "or type the number yourself.\n\n"
             "✏️ Example: <code>+998901234567</code>"
@@ -201,46 +201,11 @@ TEXTS = {
             "🔁 Type it again or tap «{send_phone}»."
         ),
     },
-    "reg.address_prompt": {
-        "uz": (
-            "📍 <b>3/3-qadam: Manzil</b>\n\n"
-            "Yashash manzilingizni yozing.\n\n"
-            "✏️ Masalan: <i>Chirchiq, Mustaqillik ko'chasi, 25-uy</i>"
-        ),
-        "ru": (
-            "📍 <b>Шаг 3/3: Адрес</b>\n\n"
-            "Напишите ваш адрес проживания.\n\n"
-            "✏️ Например: <i>Чирчик, ул. Мустакиллик, дом 25</i>"
-        ),
-        "en": (
-            "📍 <b>Step 3/3: Address</b>\n\n"
-            "Type your home address.\n\n"
-            "✏️ Example: <i>Chirchiq, Mustaqillik street, house 25</i>"
-        ),
-    },
-    "reg.address_short": {
-        "uz": (
-            "⚠️ Manzil juda qisqa.\n\n"
-            "Iltimos, to'liqroq yozing (kamida 5 ta belgi).\n"
-            "✏️ Masalan: <i>Chirchiq, Mustaqillik ko'chasi, 25-uy</i>"
-        ),
-        "ru": (
-            "⚠️ Адрес слишком короткий.\n\n"
-            "Пожалуйста, напишите подробнее (не менее 5 символов).\n"
-            "✏️ Например: <i>Чирчик, ул. Мустакиллик, дом 25</i>"
-        ),
-        "en": (
-            "⚠️ The address is too short.\n\n"
-            "Please give more detail (at least 5 characters).\n"
-            "✏️ Example: <i>Chirchiq, Mustaqillik street, house 25</i>"
-        ),
-    },
     "reg.success": {
         "uz": (
             "🎉 <b>Ro'yxatdan o'tish muvaffaqiyatli yakunlandi!</b>\n\n"
             "👤 Ism: <b>{name}</b>\n"
-            "📱 Telefon: <b>{phone}</b>\n"
-            "📍 Manzil: <b>{address}</b>\n\n"
+            "📱 Telefon: <b>{phone}</b>\n\n"
             "Endi sizga barcha imkoniyatlar ochiq:\n"
             "• <b>E'lon qo'shish</b> — kvartirangizni ijaraga bering yoki soting\n"
             "• <b>Ilovani ochish</b> — e'lonlarni ko'ring, o'z e'lonlaringiz holatini kuzating\n\n"
@@ -249,8 +214,7 @@ TEXTS = {
         "ru": (
             "🎉 <b>Регистрация успешно завершена!</b>\n\n"
             "👤 Имя: <b>{name}</b>\n"
-            "📱 Телефон: <b>{phone}</b>\n"
-            "📍 Адрес: <b>{address}</b>\n\n"
+            "📱 Телефон: <b>{phone}</b>\n\n"
             "Теперь вам доступны все возможности:\n"
             "• <b>Добавить объявление</b> — сдайте квартиру в аренду или продайте её\n"
             "• <b>Открыть приложение</b> — смотрите объявления и следите за статусом своих\n\n"
@@ -259,8 +223,7 @@ TEXTS = {
         "en": (
             "🎉 <b>Registration complete!</b>\n\n"
             "👤 Name: <b>{name}</b>\n"
-            "📱 Phone: <b>{phone}</b>\n"
-            "📍 Address: <b>{address}</b>\n\n"
+            "📱 Phone: <b>{phone}</b>\n\n"
             "Everything is open to you now:\n"
             "• <b>Add listing</b> — rent out or sell your apartment\n"
             "• <b>Open app</b> — browse listings and track the status of your own\n\n"
@@ -604,7 +567,7 @@ TEXTS = {
     "guide.help": {
         "uz": (
             "❓ <b>Yordam</b>\n\n"
-            "• Ism, telefon yoki manzilni o'zgartirish uchun {admin}.\n"
+            "• Ism yoki telefonni o'zgartirish uchun {admin}.\n"
             "• Ilova ochilmasa yoki bot javob bermay qolsa, /start buyrug'ini yuboring.\n"
             "• Bu qo'llanmani istalgan payt «{settings}» tugmasi "
             "yoki /help buyrug'i orqali ochishingiz mumkin.\n"
@@ -612,7 +575,7 @@ TEXTS = {
         ),
         "ru": (
             "❓ <b>Помощь</b>\n\n"
-            "• Чтобы изменить имя, телефон или адрес, {admin}.\n"
+            "• Чтобы изменить имя или телефон, {admin}.\n"
             "• Если приложение не открывается или бот не отвечает, отправьте команду /start.\n"
             "• Эту инструкцию можно открыть в любое время кнопкой «{settings}» "
             "или командой /help.\n"
@@ -620,7 +583,7 @@ TEXTS = {
         ),
         "en": (
             "❓ <b>Help</b>\n\n"
-            "• To change your name, phone or address, {admin}.\n"
+            "• To change your name or phone, {admin}.\n"
             "• If the app does not open or the bot stops responding, send /start.\n"
             "• You can open this guide any time with the «{settings}» button "
             "or the /help command.\n"

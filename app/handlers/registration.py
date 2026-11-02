@@ -126,13 +126,35 @@ async def process_full_name(message: Message, state: FSMContext, lang: str = "uz
     await state.set_state(RegistrationStates.waiting_for_phone)
 
 
-async def _ask_address(message: Message, state: FSMContext, lang: str) -> None:
-    await message.answer(t(lang, "reg.address_prompt"), reply_markup=MainKeyboard.get_cancel_keyboard(lang))
-    await state.set_state(RegistrationStates.waiting_for_address)
+async def _finish_registration(message: Message, state: FSMContext, session: AsyncSession, lang: str) -> None:
+    """Save the user (name + phone) and show the main menu."""
+    data = await state.get_data()
+    try:
+        user = await UserService.create_user(
+            session=session,
+            telegram_id=message.from_user.id,
+            full_name=data['full_name'],
+            phone_number=data['phone_number'],
+            username=message.from_user.username
+        )
+        await state.clear()
+        await message.answer(
+            t(
+                lang, "reg.success",
+                name=escape(user.full_name or ''),
+                phone=escape(user.phone_number or ''),
+            ),
+            reply_markup=MainKeyboard.get_main_menu(is_registered=True, lang=lang)
+        )
+        logger.info(f"New user registered: {user.telegram_id} - {user.full_name}")
+    except Exception as e:
+        logger.error(f"Registration error: {e}")
+        await message.answer(t(lang, "reg.error"), reply_markup=ReplyKeyboardRemove())
+        await state.clear()
 
 
 @router.message(RegistrationStates.waiting_for_phone, F.contact)
-async def process_phone_contact(message: Message, state: FSMContext, lang: str = "uz"):
+async def process_phone_contact(message: Message, state: FSMContext, session: AsyncSession, lang: str = "uz"):
     """Process phone number from contact."""
     phone = message.contact.phone_number
     validated_phone = validate_phone_number(phone)
@@ -145,11 +167,11 @@ async def process_phone_contact(message: Message, state: FSMContext, lang: str =
         return
 
     await state.update_data(phone_number=validated_phone)
-    await _ask_address(message, state, lang)
+    await _finish_registration(message, state, session, lang)
 
 
 @router.message(RegistrationStates.waiting_for_phone)
-async def process_phone_text(message: Message, state: FSMContext, lang: str = "uz"):
+async def process_phone_text(message: Message, state: FSMContext, session: AsyncSession, lang: str = "uz"):
     """Process phone number from text."""
     if is_text(message.text, "btn.cancel"):
         await _cancel(message, state, lang)
@@ -174,49 +196,4 @@ async def process_phone_text(message: Message, state: FSMContext, lang: str = "u
         return
 
     await state.update_data(phone_number=validated_phone)
-    await _ask_address(message, state, lang)
-
-
-@router.message(RegistrationStates.waiting_for_address)
-async def process_address(message: Message, state: FSMContext, session: AsyncSession, lang: str = "uz"):
-    """Process address and complete registration."""
-    if is_text(message.text, "btn.cancel"):
-        await _cancel(message, state, lang)
-        return
-
-    if not message.text or len(message.text) < 5:
-        await message.answer(t(lang, "reg.address_short"))
-        return
-
-    # Get all registration data
-    data = await state.get_data()
-
-    try:
-        # Create user in database
-        user = await UserService.create_user(
-            session=session,
-            telegram_id=message.from_user.id,
-            full_name=data['full_name'],
-            phone_number=data['phone_number'],
-            address=message.text.strip(),
-            username=message.from_user.username
-        )
-
-        await state.clear()
-
-        await message.answer(
-            t(
-                lang, "reg.success",
-                name=escape(user.full_name or ''),
-                phone=escape(user.phone_number or ''),
-                address=escape(user.address or ''),
-            ),
-            reply_markup=MainKeyboard.get_main_menu(is_registered=True, lang=lang)
-        )
-
-        logger.info(f"New user registered: {user.telegram_id} - {user.full_name}")
-
-    except Exception as e:
-        logger.error(f"Registration error: {e}")
-        await message.answer(t(lang, "reg.error"), reply_markup=ReplyKeyboardRemove())
-        await state.clear()
+    await _finish_registration(message, state, session, lang)
