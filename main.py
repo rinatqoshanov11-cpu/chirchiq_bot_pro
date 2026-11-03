@@ -5,10 +5,9 @@ from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import settings
-from app.models.base import init_db, close_db, async_session_maker
+from app.models.base import init_db, close_db
 from app.handlers import (
     language_router,
     registration_router,
@@ -42,37 +41,6 @@ async def on_shutdown():
     logger.info("Closing database connections...")
     await close_db()
     logger.info("Bot stopped")
-
-
-async def setup_scheduler(bot: Bot):
-    """Setup task scheduler."""
-    if not settings.scraper_enabled:
-        logger.info("Scraper is disabled")
-        return
-
-    scheduler = AsyncIOScheduler()
-
-    # Add scraper job
-    async def scraper_job():
-        """Scraper job wrapper."""
-        from app.scrapers.olx_scraper import run_scraper_task
-
-        async with async_session_maker() as session:
-            await run_scraper_task(session, bot)
-
-    scheduler.add_job(
-        scraper_job,
-        'interval',
-        seconds=settings.scraper_interval,
-        id='apartment_scraper',
-        name='Apartment Scraper',
-        replace_existing=True
-    )
-
-    scheduler.start()
-    logger.info(f"Scheduler started: scraper interval = {settings.scraper_interval}s")
-
-    return scheduler
 
 
 async def main():
@@ -112,9 +80,6 @@ async def main():
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
-    # Setup scheduler
-    scheduler = await setup_scheduler(bot)
-
     # Mini app web server (same process); a busy port never stops the bot
     webapp_runner = None
     if settings.webapp_enabled:
@@ -131,8 +96,6 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Received stop signal")
     finally:
-        if scheduler:
-            scheduler.shutdown()
         if webapp_runner:
             await stop_webapp(webapp_runner)
         await bot.session.close()

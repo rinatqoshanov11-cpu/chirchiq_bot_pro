@@ -94,18 +94,6 @@ def truncate_text(text: str, max_length: int = 100, suffix: str = "...") -> str:
     return text[:max_length - len(suffix)].rstrip() + suffix
 
 
-def escape_markdown(text: str) -> str:
-    """Escape special characters for Markdown."""
-    special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
-    for char in special_chars:
-        text = text.replace(char, '\\' + char)
-    return text
-
-
-# ---------------------------------------------------------------------------
-# HTML helpers (the bot uses ParseMode.HTML by default)
-# ---------------------------------------------------------------------------
-
 def _esc(value) -> str:
     """HTML-escape any user-supplied value (None -> empty string)."""
     if value is None:

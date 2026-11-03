@@ -1,28 +1,18 @@
-# Versions the bot runs with (pinned from the working venv)
+# Versions the bot runs with
 
 # Telegram bot + mini app web server
 aiogram==3.31.0
 aiohttp==3.14.5
-aiofiles==25.1.0
-magic-filter==1.0.12
 
 # Database
 SQLAlchemy==2.1.6
 asyncpg==0.32.0
 greenlet==3.5.6
-alembic==1.20.1
 
 # Settings
 pydantic==2.13.5
 pydantic-settings==2.16.1
 python-dotenv==1.2.4
 
-# Utilities
+# Phone number validation
 phonenumbers==9.0.41
-structlog==26.1.0
-APScheduler==3.11.3
-beautifulsoup4==4.15.0
-certifi==2026.10.23
-
-# Avatar generator (scripts/make_avatar.py) only
-pillow==13.0.0

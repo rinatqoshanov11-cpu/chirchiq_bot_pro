@@ -17,8 +17,6 @@ services:
         value: "0.0.0.0"
       - key: WEBAPP_ENABLED
         value: "True"
-      - key: SCRAPER_ENABLED
-        value: "False"
       - key: DEBUG
         value: "False"
       - key: DB_ECHO
