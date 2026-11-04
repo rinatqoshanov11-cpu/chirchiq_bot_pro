@@ -621,12 +621,36 @@ async def error_middleware(request: web.Request, handler):
         return json_error(500, "internal server error")
 
 
+# Read-only endpoints the public website (GitHub Pages) may call from another origin.
+# Everything else (my listings, contact, delete) stays same-origin + initData only.
+PUBLIC_API_PREFIXES = ("/api/listings", "/api/photos/")
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "X-Lang",
+    "Access-Control-Max-Age": "86400",
+}
+
+
+@web.middleware
+async def cors_middleware(request: web.Request, handler):
+    """Allow cross-origin GET on the public listing endpoints only."""
+    public = request.path.startswith(PUBLIC_API_PREFIXES) and request.method in ("GET", "OPTIONS")
+    if public and request.method == "OPTIONS":
+        return web.Response(status=204, headers=CORS_HEADERS)
+    response = await handler(request)
+    if public:
+        response.headers.update(CORS_HEADERS)
+    return response
+
+
 def create_app(bot: Bot) -> web.Application:
     """Create the aiohttp application for the mini app."""
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
     PHOTO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    app = web.Application(middlewares=[error_middleware], client_max_size=64 * 1024)
+    # cors first (outermost) so JSON error responses get the headers too
+    app = web.Application(middlewares=[cors_middleware, error_middleware], client_max_size=64 * 1024)
     app["bot"] = bot
     app.add_routes(routes)
     return app
