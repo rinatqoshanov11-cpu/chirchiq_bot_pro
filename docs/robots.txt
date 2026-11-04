@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://rinatqoshanov11-cpu.github.io/chirchiq_bot_pro/sitemap.xml
