@@ -124,15 +124,15 @@ TEXTS = {
     # ---- location ----
     "listing.ask_location": {
         "uz": "🗺 <b>Kvartira joylashuvini yuboring</b>\n\n"
-              "Kvartira yonida turgan bo'lsangiz — «📍 Joylashuvni yuborish» ni bosing.\n"
+              "Kvartira yonida turgan bo'lsangiz — pastdagi «📍 Joylashuvni yuborish» ni bosing.\n"
               "Boshqa joyda bo'lsangiz: 📎 → <b>Joylashuv</b> → xaritada kvartirani belgilang.\n\n"
               "Xaridorlar uni xaritada ko'radi. Xohlamasangiz — «⏩ O'tkazib yuborish».",
         "ru": "🗺 <b>Отправьте местоположение квартиры</b>\n\n"
-              "Если вы сейчас рядом с квартирой — нажмите «📍 Отправить локацию».\n"
+              "Если вы сейчас рядом с квартирой — нажмите внизу «📍 Отправить локацию».\n"
               "Если нет: 📎 → <b>Геопозиция</b> → отметьте квартиру на карте.\n\n"
               "Клиенты увидят её на карте. Если не хотите — «⏩ Пропустить».",
         "en": "🗺 <b>Send the apartment's location</b>\n\n"
-              "If you are at the apartment now, tap «📍 Send location».\n"
+              "If you are at the apartment now, tap «📍 Send location» below.\n"
               "If not: 📎 → <b>Location</b> → mark the apartment on the map.\n\n"
               "People will see it on the map. If you'd rather not, tap «⏩ Skip».",
     },
@@ -140,6 +140,16 @@ TEXTS = {
         "uz": "✅ Joylashuv saqlandi.",
         "ru": "✅ Местоположение сохранено.",
         "en": "✅ Location saved.",
+    },
+    "listing.location_or_skip": {
+        "uz": "Joylashuvni yubormasangiz ham bo'ladi 👇",
+        "ru": "Местоположение можно и не отправлять 👇",
+        "en": "You can also skip the location 👇",
+    },
+    "listing.location_skipped": {
+        "uz": "⏩ Joylashuv o'tkazib yuborildi.",
+        "ru": "⏩ Местоположение пропущено.",
+        "en": "⏩ Location skipped.",
     },
     "listing.location_invalid": {
         "uz": "📍 «📍 Joylashuvni yuborish» tugmasini bosing yoki «⏩ O'tkazib yuborish».",
@@ -308,12 +318,40 @@ TEXTS = {
 
     # ---- photos ----
     "listing.ask_photos": {
-        "uz": "📸 <b>Kvartira rasmlarini yuboring</b> (1–{max} ta)\n\n"
+        "uz": "📸 <b>Kvartira rasmlarini yuboring</b>\n\n"
+              "Kamida <b>{min} ta</b>, ko'pi bilan {max} ta rasm. Bir nechtasini birdaniga yuborsangiz ham bo'ladi.\n"
               "Yuborib bo'lgach «✅ Tayyor» tugmasini bosing.",
-        "ru": "📸 <b>Отправьте фото квартиры</b> (1–{max} шт.)\n\n"
+        "ru": "📸 <b>Отправьте фото квартиры</b>\n\n"
+              "Минимум <b>{min}</b>, максимум {max} фото. Можно отправить несколько сразу.\n"
               "Когда отправите, нажмите «✅ Готово».",
-        "en": "📸 <b>Send photos of the apartment</b> (1–{max})\n\n"
+        "en": "📸 <b>Send photos of the apartment</b>\n\n"
+              "At least <b>{min}</b>, at most {max} photos. You can send several at once.\n"
               "When you're done, tap «✅ Done».",
+    },
+    "listing.photos_have": {
+        "uz": "Hozir: <b>{n} ta</b> rasm bor.",
+        "ru": "Сейчас: <b>{n}</b> фото.",
+        "en": "Currently: <b>{n}</b> photo(s).",
+    },
+    "listing.photos_progress": {
+        "uz": "📸 <b>{n}/{max}</b> ta rasm qabul qilindi.\n{hint}",
+        "ru": "📸 Принято фото: <b>{n}/{max}</b>.\n{hint}",
+        "en": "📸 <b>{n}/{max}</b> photos received.\n{hint}",
+    },
+    "listing.photos_need_more": {
+        "uz": "Yana kamida {more} ta rasm yuboring.",
+        "ru": "Отправьте ещё минимум {more} фото.",
+        "en": "Please send at least {more} more.",
+    },
+    "listing.photos_enough": {
+        "uz": "Yana yuborishingiz yoki «✅ Tayyor» ni bosishingiz mumkin.",
+        "ru": "Можете отправить ещё или нажать «✅ Готово».",
+        "en": "You can send more or tap «✅ Done».",
+    },
+    "listing.import_photos_more": {
+        "uz": "📸 Postda {k} ta rasm bor, kamida {min} ta kerak — yana rasm yuboring.",
+        "ru": "📸 В посте {k} фото, нужно минимум {min} — отправьте ещё.",
+        "en": "📸 The post has {k} photo(s), at least {min} are needed — send more.",
     },
     "listing.replace_photos": {
         "uz": "📸 Eski rasmlar o'rniga yangilarini yuboring.",
@@ -331,9 +369,9 @@ TEXTS = {
         "en": "✅ Photo added ({n}/{max})",
     },
     "listing.photos_required": {
-        "uz": "⚠️ Kamida 1 ta rasm yuboring.",
-        "ru": "⚠️ Отправьте хотя бы 1 фото.",
-        "en": "⚠️ Please send at least 1 photo.",
+        "uz": "⚠️ Kamida {n} ta rasm yuboring. Hozir: {k} ta",
+        "ru": "⚠️ Отправьте минимум {n} фото. Сейчас: {k}",
+        "en": "⚠️ Please send at least {n} photos. Now: {k}",
     },
     "listing.photos_invalid": {
         "uz": "📸 Rasm yuboring yoki «✅ Tayyor» tugmasini bosing.",
@@ -455,6 +493,24 @@ TEXTS = {
         "uz": "❌ E'lonni saqlashda xatolik yuz berdi. Iltimos, qaytadan urinib ko'ring.",
         "ru": "❌ Не удалось сохранить объявление. Пожалуйста, попробуйте ещё раз.",
         "en": "❌ Something went wrong while saving the listing. Please try again.",
+    },
+
+    # ---- admin import: phone step ----
+    "listing.import_ask_phone": {
+        "uz": "📞 <b>Telefon raqami topilmadi.</b>\n\n"
+              "E'lon uchun aloqa raqamini yozing (masalan, <code>+998901234567</code>) "
+              "yoki pastdagi tugma bilan o'z raqamingizni tanlang:",
+        "ru": "📞 <b>Номер телефона не найден.</b>\n\n"
+              "Напишите контактный номер для объявления (например, <code>+998901234567</code>) "
+              "или выберите свой номер кнопкой ниже:",
+        "en": "📞 <b>No phone number found.</b>\n\n"
+              "Type the contact number for the listing (for example <code>+998901234567</code>) "
+              "or pick your own number with the button below:",
+    },
+    "listing.import_phone_invalid": {
+        "uz": "⚠️ Raqam noto'g'ri. Masalan: +998901234567",
+        "ru": "⚠️ Неверный номер. Например: +998901234567",
+        "en": "⚠️ Invalid number. For example: +998901234567",
     },
 
     # ---- contact alert (plain text, show_alert) ----

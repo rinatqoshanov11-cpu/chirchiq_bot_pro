@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from aiogram import Router, F
 from aiogram.filters import BaseFilter, Command, StateFilter
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove
 from aiogram.fsm.context import FSMContext
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,8 +25,10 @@ from app.models.apartment import ApartmentType
 from app.models.base import async_session_maker
 from app.utils import format_price, get_logger
 from app.utils.formatters import validate_phone_number
-from app.i18n import DEFAULT_LANG, is_text
-from app.handlers.apartments import _import_next_missing, _next_or_preview, _handle_cancel, _ask_import_phone
+from app.i18n import DEFAULT_LANG, t, is_text
+from app.handlers.apartments import (
+    _import_next_missing, _next_or_preview, _handle_cancel, _ask_import_phone, _choose, _freeze_step,
+)
 from config import settings
 
 try:  # the parser module is a separate deliverable; the bot must still start without it
@@ -146,8 +148,11 @@ def _summary(parsed, photos: List[str], address: Optional[str]) -> str:
     else:
         lines.append("❌ Telefon topilmadi — so'rayman")
 
-    if photos:
+    minimum = max(1, int(settings.min_photos_per_ad))
+    if len(photos) >= minimum:
         lines.append(f"✅ Rasmlar: {len(photos)} ta")
+    elif photos:
+        lines.append(f"⚠️ Rasmlar: {len(photos)} ta (kamida {minimum} ta kerak) — yana so'rayman")
     else:
         lines.append("❌ Rasmlar topilmadi — so'rayman")
 
@@ -344,7 +349,8 @@ async def _process_post(message: Message, state: FSMContext, session: AsyncSessi
         'import_source_chat': origin,
     })
 
-    await message.answer(_summary(parsed, photos, address))
+    # The missing fields are asked with inline buttons: hide the "cancel" reply keyboard
+    await message.answer(_summary(parsed, photos, address), reply_markup=ReplyKeyboardRemove())
     await _import_next_missing(message, state, 'uz')
 
 
@@ -352,17 +358,36 @@ async def _process_post(message: Message, state: FSMContext, session: AsyncSessi
 # waiting_for_phone (only reached when the post had no phone number)
 # ---------------------------------------------------------------------------
 
+async def _set_import_phone(message: Message, state: FSMContext, lang: str, phone: str):
+    await state.update_data(phone_number=phone)
+    await _next_or_preview(message, state, _import_next_missing, lang)
+
+
+@router.callback_query(ImportStates.waiting_for_phone, F.data == "lf:phone:self")
+async def cb_import_phone_self(callback: CallbackQuery, state: FSMContext, lang: str = DEFAULT_LANG):
+    """'📱 O'zimning raqamim: +998…' -> the admin's own number becomes the contact phone."""
+    data = await state.get_data()
+    phone = validate_phone_number(str(data.get('admin_phone') or ""))
+    if not phone:
+        await callback.answer(t(lang, "listing.import_phone_invalid"), show_alert=True)
+        return
+    await callback.answer()
+    message = await _choose(callback, state, lang, phone)
+    if message:
+        await _set_import_phone(message, state, lang, phone)
+
+
 @router.message(ImportStates.waiting_for_phone)
 async def receive_import_phone(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
+    """A typed number or a shared contact (the step message keeps its inline buttons until then)."""
     if await _handle_cancel(message, state, lang):
         return
 
     raw = message.contact.phone_number if message.contact else (message.text or "")
     phone = validate_phone_number(raw) if raw else None
     if not phone:
-        await message.answer("⚠️ Raqam noto'g'ri. Masalan: +998901234567")
-        await _ask_import_phone(message, state, lang)
+        await message.answer(t(lang, "listing.import_phone_invalid"))
         return
 
-    await state.update_data(phone_number=phone)
-    await _next_or_preview(message, state, _import_next_missing, lang)
+    await _freeze_step(message, state)
+    await _set_import_phone(message, state, lang, phone)

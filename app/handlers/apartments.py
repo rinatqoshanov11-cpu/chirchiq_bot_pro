@@ -1,16 +1,23 @@
 """Apartment handlers (listing-creation flow, localized: uz / ru / en).
 
-Every handler takes ``lang`` (injected by LanguageMiddleware) and passes it explicitly to the
-_ask_* / preview helpers. Button taps are matched in ANY language (is_text / keyboard helpers),
-so an old keyboard left in the chat after a language switch still works.
+The whole form is driven by INLINE buttons attached to each step message (callback_data
+prefix "lf:", see ApartmentKeyboard.inline_*). Typed answers still work where they make
+sense (address detail, custom price, m², floor, description, phone) and the old reply-button
+labels are still understood (is_text) so a stale keyboard in the chat does no harm.
+The only reply keyboard left is Telegram's "share location" button at the location step.
+
+After a tap the step message loses its buttons (and shows the chosen value), callbacks whose
+state no longer matches are answered with a short "step is over" toast — so double taps and
+old buttons are harmless. Every handler takes ``lang`` (injected by LanguageMiddleware).
 The admin notification (notify_admins_new_apartment) stays Uzbek on purpose.
 """
 import html
 import math
+from typing import Optional
 
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
-from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from aiogram.filters import StateFilter
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove
 from aiogram.fsm.context import FSMContext
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +41,16 @@ router = Router()
 CANCEL = t("uz", "btn.cancel")
 SKIP = t("uz", "btn.skip")
 
+# States where "⏩ O'tkazib yuborish" (lf:skip) is allowed
+SKIPPABLE_STATES = (
+    ApartmentStates.waiting_for_address_detail,
+    ApartmentStates.waiting_for_location,
+    ApartmentStates.waiting_for_area,
+    ApartmentStates.waiting_for_floor,
+    ApartmentStates.waiting_for_total_floors,
+    ApartmentStates.waiting_for_description,
+)
+
 
 def _type_key(data: dict) -> str:
     """'rent' or 'sale' (FSM data may hold the enum or its string value)."""
@@ -56,48 +73,93 @@ def _contact_admin(lang: str) -> str:
     return t(lang, "listing.contact_admin")
 
 
+def _min_photos() -> int:
+    return max(1, int(settings.min_photos_per_ad))
+
+
 # ---------------------------------------------------------------------------
-# Step prompts (used both by the normal flow and by "✏️ Tahrirlash")
+# Inline-step plumbing
+# ---------------------------------------------------------------------------
+
+async def _send_step(message: Message, state: FSMContext, text: str, keyboard, **extra) -> Message:
+    """Send a step prompt with its inline keyboard and remember it (lf_msg) so the buttons can be removed later."""
+    sent = await message.answer(text, reply_markup=keyboard, **extra)
+    await state.update_data(lf_msg=sent.message_id)
+    return sent
+
+
+async def _freeze_step(message: Message, state: FSMContext, except_id: Optional[int] = None):
+    """Remove the inline keyboard of the remembered step message (answer typed / step passed)."""
+    data = await state.get_data()
+    msg_id = data.get('lf_msg')
+    if not msg_id:
+        return
+    await state.update_data(lf_msg=None)
+    if msg_id == except_id:
+        return
+    try:
+        await message.bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=msg_id, reply_markup=None)
+    except Exception:
+        pass
+
+
+async def _choose(callback: CallbackQuery, state: FSMContext, lang: str, chosen: Optional[str] = None) -> Optional[Message]:
+    """A step button was tapped: show the chosen value on the step message and drop its buttons.
+
+    Returns the message to continue the dialogue with (None if Telegram gave no accessible message).
+    """
+    message = callback.message
+    if not isinstance(message, Message):
+        return None
+    done = False
+    if chosen is not None and message.text:
+        try:
+            await message.edit_text(f"{message.html_text}\n\n{t(lang, 'lf.chosen', value=html.escape(chosen))}")
+            done = True
+        except Exception:
+            pass
+    if not done:
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    await _freeze_step(message, state, except_id=message.message_id)
+    return message
+
+
+# ---------------------------------------------------------------------------
+# Step prompts (used by the normal flow, by "✏️ Tahrirlash" and by the admin import)
 # ---------------------------------------------------------------------------
 
 async def _ask_type(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    await message.answer(
-        t(lang, "listing.ask_type"),
-        reply_markup=ApartmentKeyboard.get_apartment_type(lang)
-    )
+    await _send_step(message, state, t(lang, "listing.ask_type"), ApartmentKeyboard.inline_type(lang))
     await state.set_state(ApartmentStates.waiting_for_type)
 
 
 async def _ask_rooms(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    await message.answer(
-        t(lang, "listing.ask_rooms"),
-        reply_markup=ApartmentKeyboard.get_rooms_keyboard(lang)
-    )
+    await _send_step(message, state, t(lang, "listing.ask_rooms"), ApartmentKeyboard.inline_rooms(lang))
     await state.set_state(ApartmentStates.waiting_for_rooms)
 
 
 async def _ask_address(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    await message.answer(
-        t(lang, "listing.ask_address"),
-        reply_markup=ApartmentKeyboard.get_city_area_keyboard(lang)
-    )
+    await _send_step(message, state, t(lang, "listing.ask_address"), ApartmentKeyboard.inline_areas(lang))
     await state.set_state(ApartmentStates.waiting_for_address)
 
 
 async def _ask_address_detail(message: Message, state: FSMContext, area: str, lang: str = DEFAULT_LANG):
     """``area`` is the canonical (Uzbek) area name; it is shown in ``lang``."""
-    await message.answer(
+    await _send_step(
+        message, state,
         t(lang, "listing.ask_address_detail", area=html.escape(area_label(area, lang))),
-        reply_markup=ApartmentKeyboard.get_address_detail_keyboard(lang)
+        ApartmentKeyboard.inline_skip_cancel(lang),
     )
     await state.set_state(ApartmentStates.waiting_for_address_detail)
 
 
 async def _ask_location(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    await message.answer(
-        t(lang, "listing.ask_location"),
-        reply_markup=ApartmentKeyboard.get_location_keyboard(lang)
-    )
+    """The one step with a reply keyboard (Telegram's location button); skip / cancel are inline."""
+    await message.answer(t(lang, "listing.ask_location"), reply_markup=ApartmentKeyboard.location_reply_keyboard(lang))
+    await _send_step(message, state, t(lang, "listing.location_or_skip"), ApartmentKeyboard.inline_skip_cancel(lang))
     await state.set_state(ApartmentStates.waiting_for_location)
 
 
@@ -105,32 +167,25 @@ async def _ask_price(message: Message, state: FSMContext, lang: str = DEFAULT_LA
     data = await state.get_data()
     type_key = _type_key(data)
     key = "listing.ask_price_rent" if type_key == "rent" else "listing.ask_price_sale"
-    await message.answer(t(lang, key), reply_markup=ApartmentKeyboard.get_price_keyboard(type_key, lang))
+    await _send_step(message, state, t(lang, key), ApartmentKeyboard.inline_price(type_key, lang))
     await state.set_state(ApartmentStates.waiting_for_price)
 
 
 async def _ask_area(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
     data = await state.get_data()
-    await message.answer(
-        t(lang, "listing.ask_area"),
-        reply_markup=ApartmentKeyboard.get_area_keyboard(data.get('rooms'), lang)
-    )
+    await _send_step(message, state, t(lang, "listing.ask_area"), ApartmentKeyboard.inline_m2(data.get('rooms'), lang))
     await state.set_state(ApartmentStates.waiting_for_area)
 
 
 async def _ask_floor(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    await message.answer(
-        t(lang, "listing.ask_floor"),
-        reply_markup=ApartmentKeyboard.get_floor_keyboard(lang)
-    )
+    await _send_step(message, state, t(lang, "listing.ask_floor"), ApartmentKeyboard.inline_floor(lang))
     await state.set_state(ApartmentStates.waiting_for_floor)
 
 
 async def _ask_total_floors(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
     data = await state.get_data()
-    await message.answer(
-        t(lang, "listing.ask_total_floors"),
-        reply_markup=ApartmentKeyboard.get_total_floors_keyboard(data.get('floor'), lang)
+    await _send_step(
+        message, state, t(lang, "listing.ask_total_floors"), ApartmentKeyboard.inline_tf(data.get('floor'), lang)
     )
     await state.set_state(ApartmentStates.waiting_for_total_floors)
 
@@ -149,37 +204,34 @@ DESCRIPTION_TAGS = {kind: description_tags(kind, "uz") for kind in TAG_COUNT}
 
 
 def _description_tags_keyboard(type_key: str, selected: list, lang: str = DEFAULT_LANG):
-    """Inline chips; tapped ones get a ✅."""
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    builder = InlineKeyboardBuilder()
-    for i, tag in enumerate(description_tags(type_key, lang)):
-        mark = "✅ " if i in selected else ""
-        builder.button(text=f"{mark}{tag}", callback_data=f"dtag_{i}")
-    builder.adjust(2)
-    return builder.as_markup()
+    """Inline chips (tapped ones get a ✅) + done / skip / cancel."""
+    return ApartmentKeyboard.inline_description(description_tags(type_key, lang), selected, lang)
 
 
 async def _ask_description(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
     data = await state.get_data()
     type_key = _type_key(data)
     await state.update_data(desc_tags=[])
-    await message.answer(
-        t(lang, "listing.ask_description"),
-        reply_markup=ApartmentKeyboard.get_description_keyboard(lang)
-    )
-    chips = await message.answer(
-        t(lang, "listing.chips_hint"),
-        reply_markup=_description_tags_keyboard(type_key, [], lang)
+    chips = await _send_step(
+        message, state,
+        t(lang, "listing.ask_description") + "\n\n" + t(lang, "listing.chips_hint"),
+        _description_tags_keyboard(type_key, [], lang),
     )
     await state.update_data(desc_chips_msg=chips.message_id)
     await state.set_state(ApartmentStates.waiting_for_description)
 
 
 async def _ask_photos(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    await message.answer(
-        t(lang, "listing.ask_photos", max=settings.photos_per_ad),
-        reply_markup=ApartmentKeyboard.get_photos_done_keyboard(lang)
+    """Photos prompt; the photos already in the FSM (import / nothing) are counted in."""
+    data = await state.get_data()
+    count = len(data.get('photos') or [])
+    text = t(lang, "listing.ask_photos", min=_min_photos(), max=settings.photos_per_ad)
+    if count:
+        text += "\n\n" + t(lang, "listing.photos_have", n=count)
+    sent = await _send_step(
+        message, state, text, ApartmentKeyboard.inline_photos(count, _min_photos(), settings.photos_per_ad, lang)
     )
+    await state.update_data(photos_status_msg=sent.message_id)
     await state.set_state(ApartmentStates.waiting_for_photos)
 
 
@@ -206,20 +258,12 @@ def _import_price_ok(data: dict) -> bool:
 
 
 async def _ask_import_phone(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    """Import mode: contact phone not found in the post -> admin's own number as a one-tap button."""
+    """Import mode: contact phone not found in the post -> admin's own number as a one-tap inline button."""
     data = await state.get_data()
-    builder = ReplyKeyboardBuilder()
-    admin_phone = data.get('admin_phone')
-    if admin_phone:
-        builder.button(text=str(admin_phone))
-    builder.button(text="📱 Kontaktimni yuborish", request_contact=True)
-    builder.button(text=t("uz", "btn.cancel"))
-    builder.adjust(1)
-    await message.answer(
-        "📞 <b>Telefon raqami topilmadi.</b>\n\n"
-        "E'lon uchun aloqa raqamini yozing (masalan, +998901234567) "
-        "yoki pastdagi tugma bilan o'z raqamingizni tanlang:",
-        reply_markup=builder.as_markup(resize_keyboard=True)
+    await _send_step(
+        message, state,
+        t(lang, "listing.import_ask_phone"),
+        ApartmentKeyboard.inline_import_phone(data.get('admin_phone'), lang),
     )
     await state.set_state(ImportStates.waiting_for_phone)
 
@@ -227,9 +271,10 @@ async def _ask_import_phone(message: Message, state: FSMContext, lang: str = DEF
 async def _import_next_missing(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
     """Ask the first REQUIRED field the parser did not find; when none is missing -> preview.
 
-    Order: type -> rooms -> address -> price -> phone -> photos.
+    Order: type -> rooms -> address -> price -> phone -> photos (at least settings.min_photos_per_ad).
     """
     data = await state.get_data()
+    photos = data.get('photos') or []
     if not data.get('type'):
         await _ask_type(message, state, lang)
     elif not data.get('rooms'):
@@ -243,7 +288,9 @@ async def _import_next_missing(message: Message, state: FSMContext, lang: str = 
         await _ask_price(message, state, lang)
     elif not data.get('phone_number'):
         await _ask_import_phone(message, state, lang)
-    elif not data.get('photos'):
+    elif len(photos) < _min_photos():
+        if photos:
+            await message.answer(t(lang, "listing.import_photos_more", k=len(photos), min=_min_photos()))
         await _ask_photos(message, state, lang)
     else:
         await state.update_data(import_complete=True, editing=False)
@@ -251,7 +298,7 @@ async def _import_next_missing(message: Message, state: FSMContext, lang: str = 
 
 
 async def _show_preview(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    """Show how the listing will look, with ✅ / ✏️ / ❌ buttons."""
+    """Show how the listing will look, with inline ✅ / ✏️ / ❌ buttons."""
     data = await state.get_data()
     type_key = _type_key(data)
     type_text = t(lang, "listing.badge_rent" if type_key == "rent" else "listing.badge_sale")
@@ -278,9 +325,9 @@ async def _show_preview(message: Message, state: FSMContext, lang: str = DEFAULT
     preview += "\n" + t(lang, "listing.photos_count", n=len(data.get('photos', []))) + "\n\n"
     preview += t(lang, "listing.preview_hint")
 
-    keyboard = ApartmentKeyboard.get_confirm_keyboard(lang)
+    keyboard = ApartmentKeyboard.inline_confirm(lang)
     try:
-        await message.answer_photo(photo=data['photos'][0], caption=preview, reply_markup=keyboard)
+        sent = await message.answer_photo(photo=data['photos'][0], caption=preview, reply_markup=keyboard)
     except Exception as e:
         # Caption too long (e.g. emoji-heavy text): send photo and text separately
         logger.warning(f"Preview caption failed, sending separately: {e}")
@@ -289,7 +336,8 @@ async def _show_preview(message: Message, state: FSMContext, lang: str = DEFAULT
                 await message.answer_photo(photo=data['photos'][0])
             except Exception:
                 pass
-        await message.answer(preview, reply_markup=keyboard)
+        sent = await message.answer(preview, reply_markup=keyboard)
+    await state.update_data(lf_msg=sent.message_id)
     await state.set_state(ApartmentStates.confirm_apartment)
 
 
@@ -302,24 +350,26 @@ async def _next_or_preview(message: Message, state: FSMContext, next_step, lang:
         return
     if data.get('editing'):
         await state.update_data(editing=False, photos_backup=None, type_backup=None, floor_backup=None, address_backup=None)
-        await message.answer(t(lang, "listing.changed"))
+        await message.answer(t(lang, "listing.changed"), reply_markup=ReplyKeyboardRemove())
         await _show_preview(message, state, lang)
     else:
         await next_step(message, state, lang)
 
 
-async def _handle_cancel(message: Message, state: FSMContext, lang: str = DEFAULT_LANG) -> bool:
-    """'❌ Bekor qilish' (any language): in edit mode undo just this change, otherwise drop the listing."""
-    if not is_text(message.text, "btn.cancel"):
-        return False
+async def _cancel_flow(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
+    """Cancel: in edit mode undo just this change, in the edit menu go back, otherwise drop the listing."""
+    current = await state.get_state()
     data = await state.get_data()
+    if current == ApartmentStates.choosing_edit_field.state:
+        await _show_preview(message, state, lang)
+        return
     if _import_in_progress(data):
         await state.clear()
         await message.answer(
             "❌ Import bekor qilindi.",
             reply_markup=MainKeyboard.get_main_menu(is_registered=True, lang=lang)
         )
-        return True
+        return
     if data.get('editing'):
         restore = {'editing': False}
         if data.get('photos_backup') is not None:
@@ -335,7 +385,7 @@ async def _handle_cancel(message: Message, state: FSMContext, lang: str = DEFAUL
             old_floor, old_total = data['floor_backup']
             restore.update(floor=old_floor, total_floors=old_total, floor_backup=None)
         await state.update_data(**restore)
-        await message.answer(t(lang, "listing.change_cancelled"))
+        await message.answer(t(lang, "listing.change_cancelled"), reply_markup=ReplyKeyboardRemove())
         await _show_preview(message, state, lang)
     else:
         await state.clear()
@@ -343,11 +393,53 @@ async def _handle_cancel(message: Message, state: FSMContext, lang: str = DEFAUL
             t(lang, "listing.cancelled"),
             reply_markup=MainKeyboard.get_main_menu(is_registered=True, lang=lang)
         )
+
+
+async def _handle_cancel(message: Message, state: FSMContext, lang: str = DEFAULT_LANG) -> bool:
+    """Typed '❌ Bekor qilish' (any language, e.g. from an old reply keyboard)."""
+    if not is_text(message.text, "btn.cancel"):
+        return False
+    await _freeze_step(message, state)
+    await _cancel_flow(message, state, lang)
     return True
 
 
 # ---------------------------------------------------------------------------
-# Flow handlers
+# Generic inline buttons: cancel (every listing / import-phone state) and skip
+# ---------------------------------------------------------------------------
+
+@router.callback_query(StateFilter(ApartmentStates, ImportStates.waiting_for_phone), F.data == "lf:cancel")
+async def cb_cancel(callback: CallbackQuery, state: FSMContext, lang: str = DEFAULT_LANG):
+    await callback.answer()
+    message = await _choose(callback, state, lang)
+    if message:
+        await _cancel_flow(message, state, lang)
+
+
+@router.callback_query(StateFilter(*SKIPPABLE_STATES), F.data == "lf:skip")
+async def cb_skip(callback: CallbackQuery, state: FSMContext, lang: str = DEFAULT_LANG):
+    await callback.answer()
+    current = await state.get_state()
+    message = await _choose(callback, state, lang, t(lang, "btn.skip"))
+    if not message:
+        return
+    if current == ApartmentStates.waiting_for_address_detail.state:
+        await _set_address_detail(message, state, lang, None)
+    elif current == ApartmentStates.waiting_for_location.state:
+        await message.answer(t(lang, "listing.location_skipped"), reply_markup=ReplyKeyboardRemove())
+        await _set_location(message, state, lang, None, None)
+    elif current == ApartmentStates.waiting_for_area.state:
+        await _set_area(message, state, lang, None)
+    elif current == ApartmentStates.waiting_for_floor.state:
+        await _set_floor(message, state, lang, None, None)
+    elif current == ApartmentStates.waiting_for_total_floors.state:
+        await _set_total_floors(message, state, lang, None)
+    elif current == ApartmentStates.waiting_for_description.state:
+        await _finish_description(message, state, lang, None)
+
+
+# ---------------------------------------------------------------------------
+# Start
 # ---------------------------------------------------------------------------
 
 @router.message(F.text.in_(variants("btn.add_listing")))
@@ -370,25 +462,17 @@ async def start_add_apartment(message: Message, state: FSMContext, session: Asyn
 
     await state.update_data(owner_id=user.id, phone_number=user.phone_number)
 
-    await message.answer(t(lang, "listing.new"))
+    # The form is inline from here on: hide the main-menu reply keyboard
+    await message.answer(t(lang, "listing.new"), reply_markup=ReplyKeyboardRemove())
     await _ask_type(message, state, lang)
 
 
-@router.message(ApartmentStates.waiting_for_type)
-async def process_apartment_type(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    """Process apartment type."""
-    if await _handle_cancel(message, state, lang):
-        return
+# ---------------------------------------------------------------------------
+# Type
+# ---------------------------------------------------------------------------
 
-    type_value = ApartmentKeyboard.type_from_text(message.text)
-    apartment_type = ApartmentType(type_value) if type_value else None
-    if not apartment_type:
-        await message.answer(
-            t(lang, "listing.type_invalid"),
-            reply_markup=ApartmentKeyboard.get_apartment_type(lang)
-        )
-        return
-
+async def _set_type(message: Message, state: FSMContext, lang: str, type_value: str):
+    apartment_type = ApartmentType(type_value)
     data = await state.get_data()
     old_type = _type_key(data) if data.get('type') else None
 
@@ -403,31 +487,110 @@ async def process_apartment_type(message: Message, state: FSMContext, lang: str 
     await _next_or_preview(message, state, _ask_rooms, lang)
 
 
-@router.message(ApartmentStates.waiting_for_rooms)
-async def process_rooms(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    """Process number of rooms."""
+@router.callback_query(ApartmentStates.waiting_for_type, F.data.startswith("lf:type:"))
+async def cb_type(callback: CallbackQuery, state: FSMContext, lang: str = DEFAULT_LANG):
+    await callback.answer()
+    type_value = callback.data.removeprefix("lf:type:")
+    if type_value not in ("rent", "sale"):
+        return
+    label = t(lang, "btn.type_rent" if type_value == "rent" else "btn.type_sale")
+    message = await _choose(callback, state, lang, label)
+    if message:
+        await _set_type(message, state, lang, type_value)
+
+
+@router.message(ApartmentStates.waiting_for_type)
+async def process_apartment_type(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
+    """Typed type label (old reply keyboard) or cancel."""
     if await _handle_cancel(message, state, lang):
         return
+    type_value = ApartmentKeyboard.type_from_text(message.text)
+    if not type_value:
+        await message.answer(t(lang, "listing.type_invalid"))
+        return
+    await _freeze_step(message, state)
+    await _set_type(message, state, lang, type_value)
 
+
+# ---------------------------------------------------------------------------
+# Rooms
+# ---------------------------------------------------------------------------
+
+async def _set_rooms(message: Message, state: FSMContext, lang: str, rooms: int):
+    await state.update_data(rooms=rooms)
+    await _next_or_preview(message, state, _ask_address, lang)
+
+
+@router.callback_query(ApartmentStates.waiting_for_rooms, F.data.startswith("lf:rooms:"))
+async def cb_rooms(callback: CallbackQuery, state: FSMContext, lang: str = DEFAULT_LANG):
+    await callback.answer()
+    try:
+        rooms = int(callback.data.removeprefix("lf:rooms:"))
+        if not 1 <= rooms <= 6:
+            raise ValueError
+    except ValueError:
+        return
+    message = await _choose(callback, state, lang, "6+" if rooms == 6 else str(rooms))
+    if message:
+        await _set_rooms(message, state, lang, rooms)
+
+
+@router.message(ApartmentStates.waiting_for_rooms)
+async def process_rooms(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
+    """Typed number of rooms ('3', '6+')."""
+    if await _handle_cancel(message, state, lang):
+        return
     text = (message.text or "").strip()
     try:
         rooms = 6 if text == "6+" else int(text)
         if rooms < 1 or rooms > 10:
             raise ValueError
     except ValueError:
-        await message.answer(
-            t(lang, "listing.rooms_invalid"),
-            reply_markup=ApartmentKeyboard.get_rooms_keyboard(lang)
-        )
+        await message.answer(t(lang, "listing.rooms_invalid"))
         return
+    await _freeze_step(message, state)
+    await _set_rooms(message, state, lang, rooms)
 
-    await state.update_data(rooms=rooms)
-    await _next_or_preview(message, state, _ask_address, lang)
+
+# ---------------------------------------------------------------------------
+# Address: area button -> street/house (optional) -> location
+# ---------------------------------------------------------------------------
+
+async def _set_address(message: Message, state: FSMContext, lang: str, address: str):
+    await state.update_data(address=address[:300], address_area=None)
+    await _ask_location(message, state, lang)
+
+
+async def _ask_full_address(message: Message, state: FSMContext, lang: str):
+    """'✍️ Boshqa hudud': the whole address is typed (state stays waiting_for_address)."""
+    await state.update_data(address_area=None)
+    await _send_step(message, state, t(lang, "listing.ask_full_address"), ApartmentKeyboard.inline_cancel(lang))
+
+
+@router.callback_query(ApartmentStates.waiting_for_address, F.data.startswith("lf:area:"))
+async def cb_area(callback: CallbackQuery, state: FSMContext, lang: str = DEFAULT_LANG):
+    await callback.answer()
+    value = callback.data.removeprefix("lf:area:")
+    if value == "other":
+        message = await _choose(callback, state, lang, t(lang, "btn.other_area"))
+        if message:
+            await _ask_full_address(message, state, lang)
+        return
+    try:
+        area = CHIRCHIQ_AREAS[int(value)]
+    except (ValueError, IndexError):
+        return
+    message = await _choose(callback, state, lang, area_label(area, lang))
+    if not message:
+        return
+    # FSM keeps the canonical (Uzbek) name; the address is written in the poster's language
+    await state.update_data(address_area=area)
+    await _ask_address_detail(message, state, area, lang)
 
 
 @router.message(ApartmentStates.waiting_for_address)
 async def process_address(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    """Area button -> ask street/house; '✍️ Boshqa hudud' or typed text -> full address."""
+    """Typed area name -> ask street/house; '✍️ Boshqa hudud' label or free text -> full address."""
     if await _handle_cancel(message, state, lang):
         return
 
@@ -435,32 +598,34 @@ async def process_address(message: Message, state: FSMContext, lang: str = DEFAU
 
     area = area_from_label(text)
     if area:
-        # FSM keeps the canonical (Uzbek) name; the address is written in the poster's language
+        await _freeze_step(message, state)
         await state.update_data(address_area=area)
         await _ask_address_detail(message, state, area, lang)
         return
 
     if is_text(text, "btn.other_area"):
-        await state.update_data(address_area=None)
-        await message.answer(
-            t(lang, "listing.ask_full_address"),
-            reply_markup=MainKeyboard.get_cancel_keyboard(lang)
-        )
+        await _freeze_step(message, state)
+        await _ask_full_address(message, state, lang)
         return
 
     if len(text) < 5:
-        await message.answer(
-            t(lang, "listing.address_invalid"),
-            reply_markup=ApartmentKeyboard.get_city_area_keyboard(lang)
-        )
+        await message.answer(t(lang, "listing.address_invalid"))
         return
 
     # Free text: add the city name if the user didn't (checked in every language)
     lowered = text.lower()
     has_city = any(name.lower() in lowered for name in variants("city"))
     address = text if has_city else f"{t(lang, 'city')}, {text}"
-    await state.update_data(address=address[:300], address_area=None)
-    await _ask_location(message, state, lang)
+    await _freeze_step(message, state)
+    await _set_address(message, state, lang, address)
+
+
+async def _set_address_detail(message: Message, state: FSMContext, lang: str, detail: Optional[str]):
+    data = await state.get_data()
+    area = area_label(data.get('address_area') or "", lang)
+    city = t(lang, "city")
+    address = f"{city}, {area}, {detail}" if detail else f"{city}, {area}"
+    await _set_address(message, state, lang, address)
 
 
 @router.message(ApartmentStates.waiting_for_address_detail)
@@ -468,55 +633,82 @@ async def process_address_detail(message: Message, state: FSMContext, lang: str 
     """Street / house after an area button (optional)."""
     if await _handle_cancel(message, state, lang):
         return
-
-    data = await state.get_data()
-    area = area_label(data.get('address_area') or "", lang)
-    city = t(lang, "city")
-
     if is_text(message.text, "btn.skip"):
-        address = f"{city}, {area}"
+        detail = None
     else:
         detail = (message.text or "").strip()
         if len(detail) < 2:
-            await message.answer(
-                t(lang, "listing.address_detail_invalid"),
-                reply_markup=ApartmentKeyboard.get_address_detail_keyboard(lang)
-            )
+            await message.answer(t(lang, "listing.address_detail_invalid"))
             return
-        address = f"{city}, {area}, {detail}"
+    await _freeze_step(message, state)
+    await _set_address_detail(message, state, lang, detail)
 
-    await state.update_data(address=address[:300], address_area=None)
-    await _ask_location(message, state, lang)
+
+# ---------------------------------------------------------------------------
+# Location
+# ---------------------------------------------------------------------------
+
+async def _set_location(message: Message, state: FSMContext, lang: str, lat, lon):
+    await state.update_data(latitude=lat, longitude=lon)
+    await _next_or_preview(message, state, _ask_price, lang)
 
 
 @router.message(ApartmentStates.waiting_for_location)
 async def process_location(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    """A shared location (pin) or skip."""
+    """A shared location (pin / venue) or the typed skip label."""
     if await _handle_cancel(message, state, lang):
         return
 
-    if message.location:
-        lat, lon = message.location.latitude, message.location.longitude
-        await state.update_data(latitude=lat, longitude=lon)
-        await message.answer(
-            t(lang, "listing.location_saved"),
-            reply_markup=ApartmentKeyboard.get_location_keyboard(lang)
-        )
+    location = message.location or (message.venue.location if message.venue else None)
+    if location:
+        await _freeze_step(message, state)
+        await message.answer(t(lang, "listing.location_saved"), reply_markup=ReplyKeyboardRemove())
+        await _set_location(message, state, lang, location.latitude, location.longitude)
     elif is_text(message.text, "btn.skip"):
-        await state.update_data(latitude=None, longitude=None)
+        await _freeze_step(message, state)
+        await message.answer(t(lang, "listing.location_skipped"), reply_markup=ReplyKeyboardRemove())
+        await _set_location(message, state, lang, None, None)
     else:
-        await message.answer(
-            t(lang, "listing.location_invalid"),
-            reply_markup=ApartmentKeyboard.get_location_keyboard(lang)
-        )
-        return
+        await message.answer(t(lang, "listing.location_invalid"))
 
-    await _next_or_preview(message, state, _ask_price, lang)
+
+# ---------------------------------------------------------------------------
+# Price
+# ---------------------------------------------------------------------------
+
+async def _set_price(message: Message, state: FSMContext, lang: str, amount, currency, guessed_usd: bool = False,
+                     announce: bool = True):
+    data = await state.get_data()
+    type_key = _type_key(data)
+    await state.update_data(price=amount, currency=currency)
+    note = t(lang, "listing.price_guessed_usd") if guessed_usd else ""
+    if (announce and not data.get('editing')) or note:
+        shown = _price_text(amount, currency, type_key, lang)
+        await message.answer(t(lang, "listing.price_saved", price=shown, note=note))
+    await _next_or_preview(message, state, _ask_area, lang)
+
+
+@router.callback_query(ApartmentStates.waiting_for_price, F.data.startswith("lf:price:"))
+async def cb_price(callback: CallbackQuery, state: FSMContext, lang: str = DEFAULT_LANG):
+    await callback.answer()
+    data = await state.get_data()
+    type_key = _type_key(data)
+    try:
+        amount_text, currency = callback.data.removeprefix("lf:price:").split(":", 1)
+        amount = int(amount_text)
+        low, high = PRICE_LIMITS[(type_key, currency)]
+        if not low <= amount <= high:
+            raise ValueError
+    except (ValueError, KeyError):
+        return
+    message = await _choose(callback, state, lang, _price_text(amount, currency, type_key, lang))
+    if message:
+        await _set_price(message, state, lang, amount, currency, announce=False)
 
 
 @router.message(ApartmentStates.waiting_for_price)
 async def process_price(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    """Process apartment price: '3 mln', '500 ming', '3 млн', '$45 000', '1 500 000'..."""
+    """Typed price: '3 mln', '500 ming', '3 млн', '$45 000', '1 500 000'..."""
     if await _handle_cancel(message, state, lang):
         return
 
@@ -537,52 +729,88 @@ async def process_price(message: Message, state: FSMContext, lang: str = DEFAULT
                 low=format_price(low, currency, lang=lang),
                 high=format_price(high, currency, lang=lang),
             )
-        await message.answer(
-            t(lang, "listing.price_retry", reason=reason),
-            reply_markup=ApartmentKeyboard.get_price_keyboard(type_key, lang)
-        )
+        await message.answer(t(lang, "listing.price_retry", reason=reason))
         return
 
-    await state.update_data(price=amount, currency=currency)
-    shown = _price_text(amount, currency, type_key, lang)
-    note = t(lang, "listing.price_guessed_usd") if error == "guessed_usd" else ""
-    data = await state.get_data()
-    if not data.get('editing') or note:
-        await message.answer(t(lang, "listing.price_saved", price=shown, note=note))
-    await _next_or_preview(message, state, _ask_area, lang)
+    await _freeze_step(message, state)
+    await _set_price(message, state, lang, amount, currency, guessed_usd=(error == "guessed_usd"))
+
+
+# ---------------------------------------------------------------------------
+# Area (m²)
+# ---------------------------------------------------------------------------
+
+async def _set_area(message: Message, state: FSMContext, lang: str, area: Optional[float]):
+    await state.update_data(area=area)
+    await _next_or_preview(message, state, _ask_floor, lang)
+
+
+@router.callback_query(ApartmentStates.waiting_for_area, F.data.startswith("lf:m2:"))
+async def cb_m2(callback: CallbackQuery, state: FSMContext, lang: str = DEFAULT_LANG):
+    await callback.answer()
+    try:
+        area = float(callback.data.removeprefix("lf:m2:"))
+        if not math.isfinite(area) or area < 5 or area > 1000:
+            raise ValueError
+    except ValueError:
+        return
+    message = await _choose(callback, state, lang, t(lang, "btn.area_m2", n=f"{area:g}"))
+    if message:
+        await _set_area(message, state, lang, area)
 
 
 @router.message(ApartmentStates.waiting_for_area)
 async def process_area(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    """Process apartment area ('65', '65 m²', '65 м²')."""
+    """Typed area ('65', '65 m²', '65 м²') or the skip label."""
     if await _handle_cancel(message, state, lang):
         return
-
     if is_text(message.text, "btn.skip"):
         area = None
     else:
         area = ApartmentKeyboard.parse_area_text(message.text)
         if area is None or not math.isfinite(area) or area < 5 or area > 1000:
-            data = await state.get_data()
-            await message.answer(
-                t(lang, "listing.area_invalid"),
-                reply_markup=ApartmentKeyboard.get_area_keyboard(data.get('rooms'), lang)
-            )
+            await message.answer(t(lang, "listing.area_invalid"))
             return
+    await _freeze_step(message, state)
+    await _set_area(message, state, lang, area)
 
-    await state.update_data(area=area)
-    await _next_or_preview(message, state, _ask_floor, lang)
+
+# ---------------------------------------------------------------------------
+# Floor / building height
+# ---------------------------------------------------------------------------
+
+async def _set_floor(message: Message, state: FSMContext, lang: str, floor: Optional[int], total_floors: Optional[int]):
+    """floor None -> skipped; total known -> on to the description; else ask the building height."""
+    if floor is None or total_floors is not None:
+        await state.update_data(floor=floor, total_floors=total_floors)
+        await _next_or_preview(message, state, _ask_description, lang)
+        return
+    await state.update_data(floor=floor, total_floors=None)
+    await _ask_total_floors(message, state, lang)
+
+
+@router.callback_query(ApartmentStates.waiting_for_floor, F.data.startswith("lf:floor:"))
+async def cb_floor(callback: CallbackQuery, state: FSMContext, lang: str = DEFAULT_LANG):
+    await callback.answer()
+    try:
+        floor = int(callback.data.removeprefix("lf:floor:"))
+        if not 1 <= floor <= 100:
+            raise ValueError
+    except ValueError:
+        return
+    message = await _choose(callback, state, lang, str(floor))
+    if message:
+        await _set_floor(message, state, lang, floor, None)
 
 
 @router.message(ApartmentStates.waiting_for_floor)
 async def process_floor(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    """Floor: a button (then building height is asked), or typed '5/9' / '5'."""
+    """Typed '5/9' / '5', or the skip label."""
     if await _handle_cancel(message, state, lang):
         return
-
     if is_text(message.text, "btn.skip"):
-        await state.update_data(floor=None, total_floors=None)
-        await _next_or_preview(message, state, _ask_description, lang)
+        await _freeze_step(message, state)
+        await _set_floor(message, state, lang, None, None)
         return
 
     text = (message.text or "").strip()
@@ -597,43 +825,79 @@ async def process_floor(message: Message, state: FSMContext, lang: str = DEFAULT
             if not (1 <= floor <= 100):
                 raise ValueError
     except ValueError:
-        await message.answer(
-            t(lang, "listing.floor_invalid"),
-            reply_markup=ApartmentKeyboard.get_floor_keyboard(lang)
-        )
+        await message.answer(t(lang, "listing.floor_invalid"))
         return
 
-    if total_floors is not None:
-        await state.update_data(floor=floor, total_floors=total_floors)
-        await _next_or_preview(message, state, _ask_description, lang)
-        return
+    await _freeze_step(message, state)
+    await _set_floor(message, state, lang, floor, total_floors)
 
-    await state.update_data(floor=floor, total_floors=None)
-    await _ask_total_floors(message, state, lang)
+
+async def _set_total_floors(message: Message, state: FSMContext, lang: str, total_floors: Optional[int]):
+    await state.update_data(total_floors=total_floors)
+    await _next_or_preview(message, state, _ask_description, lang)
+
+
+@router.callback_query(ApartmentStates.waiting_for_total_floors, F.data.startswith("lf:tf:"))
+async def cb_total_floors(callback: CallbackQuery, state: FSMContext, lang: str = DEFAULT_LANG):
+    await callback.answer()
+    data = await state.get_data()
+    floor = data.get('floor') or 0
+    try:
+        total_floors = int(callback.data.removeprefix("lf:tf:"))
+        if total_floors < max(floor, 1) or total_floors > 100:
+            raise ValueError
+    except ValueError:
+        return
+    message = await _choose(callback, state, lang, t(lang, "btn.total_floors_n", n=total_floors))
+    if message:
+        await _set_total_floors(message, state, lang, total_floors)
 
 
 @router.message(ApartmentStates.waiting_for_total_floors)
 async def process_total_floors(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    """Building height: '9 qavatli' / '9-этажный' / '9 floors' button, a typed number, or skip."""
+    """Typed building height ('9', '9 qavatli') or the skip label."""
     if await _handle_cancel(message, state, lang):
         return
-
     data = await state.get_data()
     floor = data.get('floor') or 0
-
     if is_text(message.text, "btn.skip"):
         total_floors = None
     else:
         total_floors = ApartmentKeyboard.parse_total_floors_text(message.text)
         if total_floors is None or total_floors < max(floor, 1) or total_floors > 100:
-            await message.answer(
-                t(lang, "listing.total_floors_invalid", floor=floor),
-                reply_markup=ApartmentKeyboard.get_total_floors_keyboard(floor, lang)
-            )
+            await message.answer(t(lang, "listing.total_floors_invalid", floor=floor))
             return
+    await _freeze_step(message, state)
+    await _set_total_floors(message, state, lang, total_floors)
 
-    await state.update_data(total_floors=total_floors)
-    await _next_or_preview(message, state, _ask_description, lang)
+
+# ---------------------------------------------------------------------------
+# Description: chips (dtag_N) + ✅ done / skip, or typed text
+# ---------------------------------------------------------------------------
+
+def _selected_tags(data: dict, lang: str) -> list:
+    all_tags = description_tags(_type_key(data), lang)
+    return [all_tags[i] for i in sorted(data.get('desc_tags') or []) if 0 <= i < len(all_tags)]
+
+
+async def _finish_description(message: Message, state: FSMContext, lang: str, description: Optional[str]):
+    data = await state.get_data()
+    await state.update_data(description=description, desc_tags=None, desc_chips_msg=None)
+
+    # Freeze the chips message so old chips can't be tapped later
+    if data.get('desc_chips_msg') and data.get('desc_chips_msg') != message.message_id:
+        try:
+            await message.bot.edit_message_reply_markup(
+                chat_id=message.chat.id, message_id=data['desc_chips_msg'], reply_markup=None
+            )
+        except Exception:
+            pass
+
+    if data.get('editing'):
+        await _next_or_preview(message, state, _ask_photos, lang)
+    else:
+        await state.update_data(photos=[])
+        await _ask_photos(message, state, lang)
 
 
 @router.callback_query(ApartmentStates.waiting_for_description, F.data.startswith("dtag_"))
@@ -665,16 +929,25 @@ async def toggle_description_tag(callback: CallbackQuery, state: FSMContext, lan
     await callback.answer()
 
 
+@router.callback_query(ApartmentStates.waiting_for_description, F.data == "lf:done")
+async def cb_description_done(callback: CallbackQuery, state: FSMContext, lang: str = DEFAULT_LANG):
+    """'✅ Tayyor' under the chips -> the ticked chips become the description."""
+    await callback.answer()
+    data = await state.get_data()
+    description = " · ".join(_selected_tags(data, lang)) or None
+    message = await _choose(callback, state, lang, t(lang, "btn.done"))
+    if message:
+        await _finish_description(message, state, lang, description)
+
+
 @router.message(ApartmentStates.waiting_for_description)
 async def process_description(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    """'✅ Tayyor' -> ticked chips; free text -> chips + text; skip -> nothing."""
+    """Free text -> chips + text; typed done -> chips only; typed skip -> nothing."""
     if await _handle_cancel(message, state, lang):
         return
 
     data = await state.get_data()
-    type_key = _type_key(data)
-    all_tags = description_tags(type_key, lang)
-    tags = [all_tags[i] for i in sorted(data.get('desc_tags') or []) if 0 <= i < len(all_tags)]
+    tags = _selected_tags(data, lang)
 
     if is_text(message.text, "btn.skip"):
         description = None
@@ -693,29 +966,43 @@ async def process_description(message: Message, state: FSMContext, lang: str = D
         )
         return
 
-    await state.update_data(description=description, desc_tags=None, desc_chips_msg=None)
+    await _freeze_step(message, state)
+    await _finish_description(message, state, lang, description)
 
-    # Freeze the chips message so old chips can't be tapped later
-    if data.get('desc_chips_msg'):
+
+# ---------------------------------------------------------------------------
+# Photos (at least settings.min_photos_per_ad, at most settings.photos_per_ad)
+# ---------------------------------------------------------------------------
+
+async def _photos_status(message: Message, state: FSMContext, lang: str, photos: list):
+    """One status message 'N/10 qabul qilindi' with the done button; edited after every photo."""
+    data = await state.get_data()
+    n, minimum, maximum = len(photos), _min_photos(), settings.photos_per_ad
+    hint = t(lang, "listing.photos_need_more", more=minimum - n) if n < minimum else t(lang, "listing.photos_enough")
+    text = t(lang, "listing.photos_progress", n=n, max=maximum, hint=hint)
+    keyboard = ApartmentKeyboard.inline_photos(n, minimum, maximum, lang)
+
+    status_id = data.get('photos_status_msg')
+    if status_id and status_id != data.get('lf_msg'):
+        # A status message exists already (the prompt itself is never rewritten) -> edit it
         try:
-            await message.bot.edit_message_reply_markup(
-                chat_id=message.chat.id, message_id=data['desc_chips_msg'], reply_markup=None
+            await message.bot.edit_message_text(
+                chat_id=message.chat.id, message_id=status_id, text=text, reply_markup=keyboard
             )
+            return
         except Exception:
             pass
-
-    if data.get('editing'):
-        await _next_or_preview(message, state, _ask_photos, lang)
-    else:
-        await state.update_data(photos=[])
-        await _ask_photos(message, state, lang)
+    # First photo (or the status message is gone): drop the prompt's buttons, send the status message
+    await _freeze_step(message, state)
+    sent = await message.answer(text, reply_markup=keyboard)
+    await state.update_data(photos_status_msg=sent.message_id)
 
 
 @router.message(ApartmentStates.waiting_for_photos, F.photo)
 async def process_photo(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    """Process apartment photos."""
+    """Collect photos; progress is shown by editing one status message."""
     data = await state.get_data()
-    photos = data.get('photos', [])
+    photos = list(data.get('photos') or [])
 
     if len(photos) >= settings.photos_per_ad:
         await message.answer(t(lang, "listing.photos_limit", max=settings.photos_per_ad))
@@ -723,23 +1010,52 @@ async def process_photo(message: Message, state: FSMContext, lang: str = DEFAULT
 
     photos.append(message.photo[-1].file_id)
     await state.update_data(photos=photos)
-    await message.answer(t(lang, "listing.photo_added", n=len(photos), max=settings.photos_per_ad))
+    await _photos_status(message, state, lang, photos)
 
 
-@router.message(ApartmentStates.waiting_for_photos, F.text.in_(variants("btn.done")))
-async def photos_done(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    """Finalize photos and show confirmation."""
+async def _finish_photos(message: Message, state: FSMContext, lang: str):
     data = await state.get_data()
-
-    if not data.get('photos'):
-        await message.answer(t(lang, "listing.photos_required"))
-        return
-
-    await state.update_data(editing=False, photos_backup=None, type_backup=None, floor_backup=None, address_backup=None)
+    status_id = data.get('photos_status_msg')
+    if status_id and status_id != message.message_id:
+        # Typed '✅ Tayyor': the status message still shows the done button -> drop it
+        try:
+            await message.bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=status_id, reply_markup=None)
+        except Exception:
+            pass
+    await state.update_data(
+        editing=False, photos_backup=None, type_backup=None, floor_backup=None, address_backup=None,
+        photos_status_msg=None,
+    )
     if data.get('import_mode'):
         # Photos are the last required field in import mode -> the import is complete
         await state.update_data(import_complete=True)
     await _show_preview(message, state, lang)
+
+
+@router.callback_query(ApartmentStates.waiting_for_photos, F.data == "lf:photos_done")
+async def cb_photos_done(callback: CallbackQuery, state: FSMContext, lang: str = DEFAULT_LANG):
+    """'✅ Tayyor' -> preview (refused while there are fewer than the minimum photos)."""
+    data = await state.get_data()
+    count = len(data.get('photos') or [])
+    if count < _min_photos():
+        await callback.answer(t(lang, "listing.photos_required", n=_min_photos(), k=count), show_alert=True)
+        return
+    await callback.answer()
+    message = await _choose(callback, state, lang)
+    if message:
+        await _finish_photos(message, state, lang)
+
+
+@router.message(ApartmentStates.waiting_for_photos, F.text.in_(variants("btn.done")))
+async def photos_done(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
+    """Typed '✅ Tayyor' (old reply keyboard)."""
+    data = await state.get_data()
+    count = len(data.get('photos') or [])
+    if count < _min_photos():
+        await message.answer(t(lang, "listing.photos_required", n=_min_photos(), k=count))
+        return
+    await _freeze_step(message, state)
+    await _finish_photos(message, state, lang)
 
 
 @router.message(ApartmentStates.waiting_for_photos)
@@ -750,32 +1066,12 @@ async def invalid_photo_input(message: Message, state: FSMContext, lang: str = D
     await message.answer(t(lang, "listing.photos_invalid"))
 
 
-@router.message(ApartmentStates.confirm_apartment)
-async def confirm_apartment(message: Message, state: FSMContext, session: AsyncSession, lang: str = DEFAULT_LANG):
-    """Confirm, edit or cancel the listing."""
-    if is_text(message.text, "btn.cancel"):
-        await state.clear()
-        await message.answer(
-            t(lang, "listing.cancelled"),
-            reply_markup=MainKeyboard.get_main_menu(is_registered=True, lang=lang)
-        )
-        return
+# ---------------------------------------------------------------------------
+# Preview: ✅ confirm / ✏️ edit / ❌ cancel
+# ---------------------------------------------------------------------------
 
-    if is_text(message.text, "btn.edit"):
-        await message.answer(
-            t(lang, "listing.edit_menu"),
-            reply_markup=ApartmentKeyboard.get_edit_fields_keyboard(lang)
-        )
-        await state.set_state(ApartmentStates.choosing_edit_field)
-        return
-
-    if not is_text(message.text, "btn.confirm"):
-        await message.answer(
-            t(lang, "listing.confirm_invalid"),
-            reply_markup=ApartmentKeyboard.get_confirm_keyboard(lang)
-        )
-        return
-
+async def _save_listing(message: Message, state: FSMContext, session: AsyncSession, lang: str):
+    """Save the listing (manual: pending + admins notified; import: approved at once)."""
     data = await state.get_data()
     import_mode = bool(data.get('import_mode'))
     # Leave the confirm state BEFORE saving, so a quick second tap can't save twice
@@ -846,34 +1142,60 @@ async def confirm_apartment(message: Message, state: FSMContext, session: AsyncS
         await state.clear()
 
 
-@router.message(ApartmentStates.choosing_edit_field)
-async def choose_edit_field(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    """User picked which field to change."""
-    if is_text(message.text, "btn.edit_back") or is_text(message.text, "btn.cancel"):
-        await _show_preview(message, state, lang)
-        return
+async def _open_edit_menu(message: Message, state: FSMContext, lang: str):
+    await _send_step(message, state, t(lang, "listing.edit_menu"), ApartmentKeyboard.inline_edit_fields(lang))
+    await state.set_state(ApartmentStates.choosing_edit_field)
 
-    field = ApartmentKeyboard.edit_field_from_text(message.text)
-    if not field:
-        await message.answer(
-            t(lang, "listing.edit_field_invalid"),
-            reply_markup=ApartmentKeyboard.get_edit_fields_keyboard(lang)
-        )
-        return
 
+@router.callback_query(ApartmentStates.confirm_apartment, F.data == "lf:confirm")
+async def cb_confirm(callback: CallbackQuery, state: FSMContext, session: AsyncSession, lang: str = DEFAULT_LANG):
+    await callback.answer()
+    message = await _choose(callback, state, lang)
+    if message:
+        await _save_listing(message, state, session, lang)
+
+
+@router.callback_query(ApartmentStates.confirm_apartment, F.data == "lf:edit")
+async def cb_edit(callback: CallbackQuery, state: FSMContext, lang: str = DEFAULT_LANG):
+    await callback.answer()
+    message = await _choose(callback, state, lang)
+    if message:
+        await _open_edit_menu(message, state, lang)
+
+
+@router.message(ApartmentStates.confirm_apartment)
+async def confirm_apartment(message: Message, state: FSMContext, session: AsyncSession, lang: str = DEFAULT_LANG):
+    """Typed ✅ / ✏️ / ❌ labels (old reply keyboard)."""
+    if await _handle_cancel(message, state, lang):
+        return
+    if is_text(message.text, "btn.edit"):
+        await _freeze_step(message, state)
+        await _open_edit_menu(message, state, lang)
+        return
+    if not is_text(message.text, "btn.confirm"):
+        await message.answer(t(lang, "listing.confirm_invalid"))
+        return
+    await _freeze_step(message, state)
+    await _save_listing(message, state, session, lang)
+
+
+# ---------------------------------------------------------------------------
+# Edit menu
+# ---------------------------------------------------------------------------
+
+async def _start_edit(message: Message, state: FSMContext, lang: str, field: str):
+    """Remember what is needed to undo the change, then ask the field again."""
     await state.update_data(editing=True)
+    data = await state.get_data()
 
     if field == "address":
-        data = await state.get_data()
         await state.update_data(address_backup=[data.get('address'), data.get('latitude'), data.get('longitude')])
 
     if field == "floor":
         # Keep old floor/height so cancelling at the building-height step can restore them
-        data = await state.get_data()
         await state.update_data(floor_backup=[data.get('floor'), data.get('total_floors')])
 
     if field == "photos":
-        data = await state.get_data()
         # Keep old photos so "❌ Bekor qilish" can restore them
         await state.update_data(photos_backup=data.get('photos', []), photos=[])
         await message.answer(t(lang, "listing.replace_photos"))
@@ -890,6 +1212,55 @@ async def choose_edit_field(message: Message, state: FSMContext, lang: str = DEF
     }
     await prompts[field](message, state, lang)
 
+
+@router.callback_query(ApartmentStates.choosing_edit_field, F.data.startswith("lf:editf:"))
+async def cb_edit_field(callback: CallbackQuery, state: FSMContext, lang: str = DEFAULT_LANG):
+    await callback.answer()
+    field = callback.data.removeprefix("lf:editf:")
+    label_key = next((key for key, name in ApartmentKeyboard.EDIT_FIELD_KEYS.items() if name == field), None)
+    if label_key is None:
+        return
+    message = await _choose(callback, state, lang, t(lang, label_key))
+    if message:
+        await _start_edit(message, state, lang, field)
+
+
+@router.callback_query(ApartmentStates.choosing_edit_field, F.data == "lf:edit_back")
+async def cb_edit_back(callback: CallbackQuery, state: FSMContext, lang: str = DEFAULT_LANG):
+    await callback.answer()
+    message = await _choose(callback, state, lang)
+    if message:
+        await _show_preview(message, state, lang)
+
+
+@router.message(ApartmentStates.choosing_edit_field)
+async def choose_edit_field(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
+    """Typed edit-field label (old reply keyboard)."""
+    if is_text(message.text, "btn.edit_back") or is_text(message.text, "btn.cancel"):
+        await _freeze_step(message, state)
+        await _show_preview(message, state, lang)
+        return
+    field = ApartmentKeyboard.edit_field_from_text(message.text)
+    if not field:
+        await message.answer(t(lang, "listing.edit_field_invalid"))
+        return
+    await _freeze_step(message, state)
+    await _start_edit(message, state, lang, field)
+
+
+# ---------------------------------------------------------------------------
+# Stale form buttons (double tap, old message): a quiet toast instead of the fallback alert.
+# ImportStates.waiting_for_phone is left to import_listing.py (lf:phone:self lives there).
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("lf:"), ~StateFilter(ImportStates.waiting_for_phone))
+async def stale_form_button(callback: CallbackQuery, lang: str = DEFAULT_LANG):
+    await callback.answer(t(lang, "lf.stale"))
+
+
+# ---------------------------------------------------------------------------
+# Contact button under published listings
+# ---------------------------------------------------------------------------
 
 @router.callback_query(F.data.startswith("contact_"))
 async def show_contact(callback: CallbackQuery, session: AsyncSession, lang: str = DEFAULT_LANG):

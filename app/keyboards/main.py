@@ -327,6 +327,187 @@ class ApartmentKeyboard:
         builder.adjust(1, 2)
         return builder.as_markup(resize_keyboard=True, input_field_placeholder=t(lang, "ph.description"))
 
+    # ------------------------------------------------------------------
+    # Inline listing form (callback_data prefix "lf:", handled in handlers/apartments.py)
+    #   lf:type:rent|sale   lf:rooms:1..6   lf:area:<index>|other   lf:skip   lf:cancel
+    #   lf:price:<amount>:<UZS|USD>   lf:m2:<n>   lf:floor:<n>   lf:tf:<n>   lf:done
+    #   lf:photos_done   lf:confirm   lf:edit   lf:editf:<field>   lf:edit_back   lf:phone:self
+    # ------------------------------------------------------------------
+
+    CB_PREFIX = "lf:"
+    CB_CANCEL = "lf:cancel"
+    CB_SKIP = "lf:skip"
+
+    @staticmethod
+    def _cancel(builder: InlineKeyboardBuilder, lang: str) -> None:
+        builder.button(text=t(lang, "btn.cancel"), callback_data=ApartmentKeyboard.CB_CANCEL)
+
+    @staticmethod
+    def _skip(builder: InlineKeyboardBuilder, lang: str) -> None:
+        builder.button(text=t(lang, "btn.skip"), callback_data=ApartmentKeyboard.CB_SKIP)
+
+    @staticmethod
+    def inline_cancel(lang: str = DEFAULT_LANG) -> InlineKeyboardMarkup:
+        builder = InlineKeyboardBuilder()
+        ApartmentKeyboard._cancel(builder, lang)
+        return builder.as_markup()
+
+    @staticmethod
+    def inline_skip_cancel(lang: str = DEFAULT_LANG) -> InlineKeyboardMarkup:
+        builder = InlineKeyboardBuilder()
+        ApartmentKeyboard._skip(builder, lang)
+        ApartmentKeyboard._cancel(builder, lang)
+        builder.adjust(2)
+        return builder.as_markup()
+
+    @staticmethod
+    def inline_type(lang: str = DEFAULT_LANG) -> InlineKeyboardMarkup:
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t(lang, "btn.type_rent"), callback_data="lf:type:rent")
+        builder.button(text=t(lang, "btn.type_sale"), callback_data="lf:type:sale")
+        ApartmentKeyboard._cancel(builder, lang)
+        builder.adjust(2, 1)
+        return builder.as_markup()
+
+    @staticmethod
+    def inline_rooms(lang: str = DEFAULT_LANG) -> InlineKeyboardMarkup:
+        builder = InlineKeyboardBuilder()
+        for i in range(1, 6):
+            builder.button(text=str(i), callback_data=f"lf:rooms:{i}")
+        builder.button(text="6+", callback_data="lf:rooms:6")
+        ApartmentKeyboard._cancel(builder, lang)
+        builder.adjust(3, 3, 1)
+        return builder.as_markup()
+
+    @staticmethod
+    def inline_areas(lang: str = DEFAULT_LANG) -> InlineKeyboardMarkup:
+        """Chirchiq areas (index into CHIRCHIQ_AREAS), two per row, + other + cancel."""
+        from app.utils.areas import CHIRCHIQ_AREAS, area_label
+        builder = InlineKeyboardBuilder()
+        for index, area in enumerate(CHIRCHIQ_AREAS):
+            builder.button(text=area_label(area, lang), callback_data=f"lf:area:{index}")
+        builder.button(text=t(lang, "btn.other_area"), callback_data="lf:area:other")
+        ApartmentKeyboard._cancel(builder, lang)
+        rows = [2] * (len(CHIRCHIQ_AREAS) // 2) + ([1] if len(CHIRCHIQ_AREAS) % 2 else [])
+        builder.adjust(*rows, 1, 1)
+        return builder.as_markup()
+
+    @staticmethod
+    def location_reply_keyboard(lang: str = DEFAULT_LANG) -> ReplyKeyboardMarkup:
+        """The ONE reply keyboard of the inline form: Telegram's location button (skip/cancel are inline)."""
+        builder = ReplyKeyboardBuilder()
+        builder.button(text=t(lang, "btn.send_location"), request_location=True)
+        return builder.as_markup(resize_keyboard=True, one_time_keyboard=True)
+
+    @staticmethod
+    def price_preset_value(kind: str, value: int) -> tuple:
+        """('mln', 3) -> (3_000_000, 'UZS'); ('usd', 300) -> (300, 'USD')."""
+        if kind == "mln":
+            return value * 1_000_000, "UZS"
+        return value, "USD"
+
+    @staticmethod
+    def inline_price(apartment_type: str, lang: str = DEFAULT_LANG) -> InlineKeyboardMarkup:
+        """Price presets -> lf:price:<amount>:<currency>; free text is still accepted."""
+        builder = InlineKeyboardBuilder()
+        for kind, value in ApartmentKeyboard.PRICE_PRESET_SPECS.get(apartment_type, []):
+            amount, currency = ApartmentKeyboard.price_preset_value(kind, value)
+            label = t(lang, "btn.price_mln", n=value) if kind == "mln" else _fmt_usd(value)
+            builder.button(text=label, callback_data=f"lf:price:{amount}:{currency}")
+        ApartmentKeyboard._cancel(builder, lang)
+        builder.adjust(3, 3, 1)
+        return builder.as_markup()
+
+    @staticmethod
+    def inline_m2(rooms: Optional[int], lang: str = DEFAULT_LANG) -> InlineKeyboardMarkup:
+        builder = InlineKeyboardBuilder()
+        presets = ApartmentKeyboard.AREA_PRESETS.get(min(max(int(rooms or 2), 1), 6), [])
+        for value in presets:
+            builder.button(text=t(lang, "btn.area_m2", n=value), callback_data=f"lf:m2:{value}")
+        ApartmentKeyboard._skip(builder, lang)
+        ApartmentKeyboard._cancel(builder, lang)
+        first = len(presets) if len(presets) <= 3 else (3 if len(presets) == 5 else 4)
+        builder.adjust(first, 2, 2, 2)
+        return builder.as_markup()
+
+    @staticmethod
+    def inline_floor(lang: str = DEFAULT_LANG) -> InlineKeyboardMarkup:
+        builder = InlineKeyboardBuilder()
+        for value in ApartmentKeyboard.FLOOR_CHOICES:
+            builder.button(text=str(value), callback_data=f"lf:floor:{value}")
+        ApartmentKeyboard._skip(builder, lang)
+        ApartmentKeyboard._cancel(builder, lang)
+        builder.adjust(4, 4, 4, 2)
+        return builder.as_markup()
+
+    @staticmethod
+    def inline_tf(floor: Optional[int], lang: str = DEFAULT_LANG) -> InlineKeyboardMarkup:
+        """Building height (only values >= the chosen floor)."""
+        builder = InlineKeyboardBuilder()
+        options = [v for v in ApartmentKeyboard.TOTAL_FLOOR_CHOICES if v >= (floor or 0)]
+        if floor and floor not in options:
+            options = [floor] + options
+        for value in options:
+            builder.button(text=t(lang, "btn.total_floors_n", n=value), callback_data=f"lf:tf:{value}")
+        ApartmentKeyboard._skip(builder, lang)
+        ApartmentKeyboard._cancel(builder, lang)
+        rows = [3] * (len(options) // 3) + ([len(options) % 3] if len(options) % 3 else [])
+        builder.adjust(*rows, 2)
+        return builder.as_markup()
+
+    @staticmethod
+    def inline_description(tags: List[str], selected: List[int], lang: str = DEFAULT_LANG) -> InlineKeyboardMarkup:
+        """Feature chips (dtag_<i>, ticked ones get a ✅) + done / skip / cancel."""
+        builder = InlineKeyboardBuilder()
+        for i, tag in enumerate(tags):
+            mark = "✅ " if i in selected else ""
+            builder.button(text=f"{mark}{tag}", callback_data=f"dtag_{i}")
+        builder.button(text=t(lang, "btn.done"), callback_data="lf:done")
+        ApartmentKeyboard._skip(builder, lang)
+        ApartmentKeyboard._cancel(builder, lang)
+        rows = [2] * (len(tags) // 2) + ([1] if len(tags) % 2 else [])
+        builder.adjust(*rows, 1, 2)
+        return builder.as_markup()
+
+    @staticmethod
+    def inline_photos(count: int, minimum: int, maximum: int, lang: str = DEFAULT_LANG) -> InlineKeyboardMarkup:
+        """'✅ Tayyor (N ta rasm)' once enough photos were sent, before that 'yana N ta kerak'."""
+        builder = InlineKeyboardBuilder()
+        if count >= minimum:
+            builder.button(text=t(lang, "lf.photos_done", n=count), callback_data="lf:photos_done")
+        else:
+            builder.button(text=t(lang, "lf.photos_need", more=minimum - count), callback_data="lf:photos_done")
+        ApartmentKeyboard._cancel(builder, lang)
+        builder.adjust(1)
+        return builder.as_markup()
+
+    @staticmethod
+    def inline_confirm(lang: str = DEFAULT_LANG) -> InlineKeyboardMarkup:
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t(lang, "btn.confirm"), callback_data="lf:confirm")
+        builder.button(text=t(lang, "btn.edit"), callback_data="lf:edit")
+        ApartmentKeyboard._cancel(builder, lang)
+        builder.adjust(1, 2)
+        return builder.as_markup()
+
+    @staticmethod
+    def inline_edit_fields(lang: str = DEFAULT_LANG) -> InlineKeyboardMarkup:
+        builder = InlineKeyboardBuilder()
+        for key, field in ApartmentKeyboard.EDIT_FIELD_KEYS.items():
+            builder.button(text=t(lang, key), callback_data=f"lf:editf:{field}")
+        builder.button(text=t(lang, "btn.edit_back"), callback_data="lf:edit_back")
+        builder.adjust(2, 2, 2, 2, 1)
+        return builder.as_markup()
+
+    @staticmethod
+    def inline_import_phone(phone: Optional[str], lang: str = DEFAULT_LANG) -> InlineKeyboardMarkup:
+        """Import: '📱 O'zimning raqamim: +998…' (lf:phone:self) + cancel; a typed number also works."""
+        builder = InlineKeyboardBuilder()
+        if phone:
+            builder.button(text=t(lang, "lf.phone_self", phone=str(phone)), callback_data="lf:phone:self")
+        ApartmentKeyboard._cancel(builder, lang)
+        builder.adjust(1)
+        return builder.as_markup()
 
 
 class InlineKeyboards:

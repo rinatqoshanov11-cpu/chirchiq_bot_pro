@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     debug: bool = Field(default=False)
     log_level: str = Field(default="INFO")
     photos_per_ad: int = Field(default=10)
+    min_photos_per_ad: int = Field(default=3, description="Minimum number of photos a listing must have")
     max_description_length: int = Field(default=1000)
 
     # Mini app web server
