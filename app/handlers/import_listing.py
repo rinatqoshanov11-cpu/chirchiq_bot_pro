@@ -7,6 +7,10 @@ on "✅ Tasdiqlash" saves the listing with source='import' and approves it at on
 
 Admin-only feature -> every text here is Uzbek. Router order: after admin_router, before
 fallback_router (fallback answers any stateless text and swallows unknown callbacks).
+
+Clean chat (same mechanism as apartments.py): /import, the intro and the bot's hints are deleted
+when the post has been read; the forwarded post (all album items) and the "🔎 Topildi" summary are
+"sticky" — they stay while the missing fields are asked and are deleted on ✅ confirm / ❌ cancel.
 """
 import asyncio
 import html
@@ -28,6 +32,7 @@ from app.utils.formatters import validate_phone_number
 from app.i18n import DEFAULT_LANG, t, is_text
 from app.handlers.apartments import (
     _import_next_missing, _next_or_preview, _handle_cancel, _ask_import_phone, _choose, _freeze_step,
+    TrackFlowMessages, _track, _track_sticky, _purge, _say,
 )
 from config import settings
 
@@ -39,6 +44,8 @@ except ImportError:  # pragma: no cover
 
 logger = get_logger(__name__)
 router = Router()
+# Messages handled in an import / listing state are tracked for deletion (see apartments.py)
+router.message.middleware(TrackFlowMessages())
 
 ALBUM_DEBOUNCE = 1.5  # seconds to wait for the rest of a media group
 
@@ -179,10 +186,14 @@ def _summary(parsed, photos: List[str], address: Optional[str]) -> str:
 # Triggers: /import, admin-panel button, forwarded message without a state
 # ---------------------------------------------------------------------------
 
-async def _start_import(message: Message, state: FSMContext, lang: str):
+async def _start_import(message: Message, state: FSMContext, lang: str, trigger_id: Optional[int] = None):
+    """``trigger_id``: the admin's /import message (deleted together with the flow)."""
+    # A flow already running: its messages go (the trigger belongs to the new one)
+    await _purge(message.bot, message.chat.id, state, keep={trigger_id} if trigger_id else (), final=True)
     await state.clear()
     await state.set_state(ImportStates.waiting_for_post)
-    await message.answer(INTRO_TEXT, reply_markup=MainKeyboard.get_cancel_keyboard("uz"))
+    await _track(state, trigger_id)
+    await _say(message, state, INTRO_TEXT, reply_markup=MainKeyboard.get_cancel_keyboard("uz"))
 
 
 @router.message(Command("import"))
@@ -191,7 +202,7 @@ async def cmd_import(message: Message, state: FSMContext, session: AsyncSession,
     if not await _is_admin(session, message.from_user.id):
         await message.answer(NO_RIGHTS)
         return
-    await _start_import(message, state, lang)
+    await _start_import(message, state, lang, trigger_id=message.message_id)
 
 
 @router.callback_query(F.data == "admin_import")
@@ -219,6 +230,7 @@ async def forwarded_without_state(message: Message, state: FSMContext, session: 
 @router.message(ImportStates.waiting_for_post)
 async def receive_post(message: Message, state: FSMContext, session: AsyncSession, lang: str = DEFAULT_LANG):
     if is_text(message.text, "btn.cancel"):
+        await _purge(message.bot, message.chat.id, state, final=True)
         await state.clear()
         await message.answer(CANCELLED, reply_markup=MainKeyboard.get_main_menu(is_registered=True, lang=lang))
         return
@@ -231,11 +243,15 @@ async def _collect(message: Message, state: FSMContext, session: AsyncSession, l
     photo = _photo_id(message)
 
     if not text and not photo:
-        await message.answer(
+        await _say(
+            message, state,
             "⚠️ Matn yoki rasm yuboring. E'lon postini forward qiling yoki matnini qo'ying.",
             reply_markup=MainKeyboard.get_cancel_keyboard("uz")
         )
         return
+
+    # The post itself (every album item) stays in the chat until the import ends
+    await _track_sticky(state, message.message_id)
 
     group_id = getattr(message, "media_group_id", None)
     if not group_id:
@@ -273,7 +289,7 @@ async def _flush_album(key: tuple, state: FSMContext, lang: str):
     except Exception as e:
         logger.error(f"Album import failed: {e}")
         try:
-            await first.answer("⚠️ Albomni qayta ishlashda xatolik. Qaytadan yuboring.")
+            await _say(first, state, "⚠️ Albomni qayta ishlashda xatolik. Qaytadan yuboring.")
         except Exception:
             pass
 
@@ -287,19 +303,22 @@ async def _process_post(message: Message, state: FSMContext, session: AsyncSessi
 
     if not text:
         await state.update_data(import_photos=photos)
-        await message.answer(
+        await _say(
+            message, state,
             f"🖼 {len(photos)} ta rasm qabul qilindi. Matnni ham yuboring (e'lon tavsifi, narx, telefon...).",
             reply_markup=MainKeyboard.get_cancel_keyboard("uz")
         )
         return
 
     if parse_listing_text is None or address_from is None:
+        await _purge(message.bot, message.chat.id, state, final=True)
         await state.clear()
         await message.answer("⚠️ Import moduli (listing_parser) topilmadi. Administratorga xabar bering.")
         return
 
     user = await UserService.get_by_telegram_id(session, message.chat.id)
     if user is None or not getattr(user, "is_registered", False):
+        await _purge(message.bot, message.chat.id, state, final=True)
         await state.clear()
         await message.answer(
             "⚠️ Import uchun avval botda ro'yxatdan o'ting: /start → 📝 Ro'yxatdan o'tish.",
@@ -311,7 +330,7 @@ async def _process_post(message: Message, state: FSMContext, session: AsyncSessi
         parsed = parse_listing_text(text, settings.max_description_length)
     except Exception as e:  # the parser promises not to raise; stay safe anyway
         logger.error(f"parse_listing_text failed: {e}")
-        await message.answer("⚠️ Matnni tahlil qilib bo'lmadi. Boshqa matn yuboring yoki ❌ Bekor qiling.")
+        await _say(message, state, "⚠️ Matnni tahlil qilib bo'lmadi. Boshqa matn yuboring yoki ❌ Bekor qiling.")
         return
 
     try:
@@ -326,7 +345,11 @@ async def _process_post(message: Message, state: FSMContext, session: AsyncSessi
 
     description = (parsed.description or "").strip()[:settings.max_description_length] or None
 
+    tracked = await state.get_data()
     await state.set_data({
+        # message tracking survives the reset of the form data
+        'lf_trash': list(tracked.get('lf_trash') or []),
+        'lf_sticky': list(tracked.get('lf_sticky') or []),
         'owner_id': user.id,
         'phone_number': parsed.phone or None,
         'admin_phone': getattr(user, "phone_number", None),
@@ -350,7 +373,10 @@ async def _process_post(message: Message, state: FSMContext, session: AsyncSessi
     })
 
     # The missing fields are asked with inline buttons: hide the "cancel" reply keyboard
-    await message.answer(_summary(parsed, photos, address), reply_markup=ReplyKeyboardRemove())
+    summary = await message.answer(_summary(parsed, photos, address), reply_markup=ReplyKeyboardRemove())
+    await _track_sticky(state, summary.message_id)
+    # /import, the intro and the "send the text too" hints are done; the post + summary stay
+    await _purge(message.bot, message.chat.id, state)
     await _import_next_missing(message, state, 'uz')
 
 
@@ -386,7 +412,7 @@ async def receive_import_phone(message: Message, state: FSMContext, lang: str = 
     raw = message.contact.phone_number if message.contact else (message.text or "")
     phone = validate_phone_number(raw) if raw else None
     if not phone:
-        await message.answer(t(lang, "listing.import_phone_invalid"))
+        await _say(message, state, t(lang, "listing.import_phone_invalid"))
         return
 
     await _freeze_step(message, state)

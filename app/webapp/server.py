@@ -34,7 +34,7 @@ from typing import Any, List, Optional
 
 from aiogram import Bot
 from aiogram.utils.web_app import WebAppUser, safe_parse_webapp_init_data
-from aiohttp import web
+from aiohttp import BodyPartReader, web
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -799,6 +799,257 @@ async def api_me(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
+# Photo upload from the gallery (the "📸 Rasm yuborish" web_app button)
+# ---------------------------------------------------------------------------
+#
+# GET  /upload               -> static/upload.html (opens the gallery picker)
+# GET  /api/upload/status    -> {"ok": true, "waiting": bool, "total", "min", "max"}
+# POST /api/upload/photos    -> multipart/form-data, field "photo" repeated
+#
+# The user id from the signed initData is the only identity. Each image is sent
+# into that user's own chat to get a Telegram file_id, the temporary message is
+# deleted, and the file_ids go to the listing flow's FSM via
+# app.handlers.apartments.add_uploaded_photos (which also refreshes the progress
+# message in the chat).
+
+UPLOAD_MAX_FILES = 10
+UPLOAD_MAX_FILE_BYTES = 8 * 1024 * 1024
+UPLOAD_MAX_BODY = 25 * 1024 * 1024
+UPLOAD_MAX_CONCURRENT = 3  # per user
+UPLOAD_CHUNK = 64 * 1024
+# Requests other than the upload never need a body bigger than this
+SMALL_BODY_LIMIT = 64 * 1024
+UPLOAD_PATH = "/api/upload/photos"
+
+
+def _upload_error(status: int, error: str) -> web.Response:
+    return web.json_response({"ok": False, "error": error}, status=status)
+
+
+def _sniff_image(data: bytes) -> Optional[str]:
+    """'jpg' | 'png' | 'webp' from the magic bytes, else None."""
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def _photo_settings() -> tuple:
+    """(min, max) photos per listing, same rules as the bot flow."""
+    maximum = max(1, int(getattr(settings, "photos_per_ad", UPLOAD_MAX_FILES)))
+    minimum = max(1, int(getattr(settings, "min_photos_per_ad", 1)))
+    return minimum, maximum
+
+
+async def _flow_photos(request: web.Request, user_id: int) -> Optional[list]:
+    """The user's collected photos when the listing flow waits for photos, else None."""
+    from aiogram.fsm.context import FSMContext
+    from aiogram.fsm.storage.base import StorageKey
+
+    from app.states import ApartmentStates
+
+    storage = request.app.get("storage")
+    bot: Bot = request.app["bot"]
+    if storage is None:
+        return None
+    ctx = FSMContext(
+        storage=storage,
+        key=StorageKey(bot_id=bot.id, chat_id=user_id, user_id=user_id),
+    )
+    if await ctx.get_state() != ApartmentStates.waiting_for_photos.state:
+        return None
+    data = await ctx.get_data()
+    return list(data.get("photos") or [])
+
+
+def _user_lock(app: web.Application, user_id: int) -> asyncio.Lock:
+    locks = app["upload_locks"]
+    lock = locks.get(user_id)
+    if lock is None:
+        lock = locks[user_id] = asyncio.Lock()
+    return lock
+
+
+@routes.get("/upload")
+async def upload_page(request: web.Request) -> web.StreamResponse:
+    page = STATIC_DIR / "upload.html"
+    if not page.is_file():
+        raise ApiError(404, "upload page missing")
+    return web.FileResponse(page, headers={"Cache-Control": "no-cache"})
+
+
+@routes.get("/api/upload/status")
+async def api_upload_status(request: web.Request) -> web.Response:
+    tg_user = get_tg_user(request)
+    if tg_user is None:
+        return _upload_error(401, "unauthorized")
+    minimum, maximum = _photo_settings()
+    photos = await _flow_photos(request, tg_user.id)
+    return web.json_response({
+        "ok": True,
+        "waiting": photos is not None,
+        "total": len(photos or []),
+        "min": minimum,
+        "max": maximum,
+    })
+
+
+async def _read_upload_files(request: web.Request) -> tuple:
+    """Read the "photo" parts -> (list of (bytes, ext), error code or None)."""
+    content_type = request.headers.get("Content-Type", "")
+    if not content_type.lower().startswith("multipart/form-data"):
+        return [], "bad_file"
+    try:
+        reader = await request.multipart()
+    except Exception:
+        return [], "bad_file"
+
+    files: list = []
+    total = 0
+    while True:
+        try:
+            part = await reader.next()
+        except Exception:
+            return [], "bad_file"
+        if part is None:
+            break
+        if not isinstance(part, BodyPartReader) or part.name != "photo":
+            # Unknown field / nested multipart: skipped (reader.next() drains it)
+            continue
+        if len(files) >= UPLOAD_MAX_FILES:
+            return [], "too_many"
+        buffer = bytearray()
+        while True:
+            chunk = await part.read_chunk(UPLOAD_CHUNK)
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            total += len(chunk)
+            if len(buffer) > UPLOAD_MAX_FILE_BYTES:
+                return [], "bad_file"
+            if total > UPLOAD_MAX_BODY:
+                return [], "too_large"
+        data = bytes(buffer)
+        ext = _sniff_image(data)
+        if ext is None:
+            return [], "bad_file"
+        files.append((data, ext))
+    if not files:
+        return [], "bad_file"
+    return files, None
+
+
+@routes.post(UPLOAD_PATH)
+async def api_upload_photos(request: web.Request) -> web.Response:
+    from aiogram.exceptions import TelegramBadRequest
+    from aiogram.types import BufferedInputFile
+
+    tg_user = get_tg_user(request)  # header only - never a query parameter
+    if tg_user is None:
+        return _upload_error(401, "unauthorized")
+    user_id = tg_user.id
+
+    if request.content_length is not None and request.content_length > UPLOAD_MAX_BODY:
+        return _upload_error(413, "too_large")
+
+    active: dict = request.app["upload_active"]
+    if active.get(user_id, 0) >= UPLOAD_MAX_CONCURRENT:
+        return _upload_error(429, "busy")
+    active[user_id] = active.get(user_id, 0) + 1
+    try:
+        # Cheap check first: nothing is sent to the chat when the flow is elsewhere
+        photos = await _flow_photos(request, user_id)
+        if photos is None:
+            return _upload_error(409, "not_waiting")
+        minimum, maximum = _photo_settings()
+
+        files, error = await _read_upload_files(request)
+        if error == "too_large":
+            return _upload_error(413, "too_large")
+        if error:
+            return _upload_error(400, error)
+
+        room = maximum - len(photos)
+        if room <= 0:
+            return _upload_error(400, "too_many")
+        files = files[:room]  # the flow keeps at most `maximum` photos
+
+        bot: Bot = request.app["bot"]
+        file_ids: List[str] = []
+        rejected = 0
+        for data, ext in files:
+            try:
+                msg = await bot.send_photo(
+                    chat_id=user_id,
+                    photo=BufferedInputFile(data, filename=f"photo.{ext}"),
+                    disable_notification=True,
+                )
+            except TelegramBadRequest as e:
+                rejected += 1
+                logger.info("Upload: Telegram rejected a photo of user %s: %s", user_id, e)
+                continue
+            except Exception as e:
+                logger.warning("Upload: send_photo failed for user %s: %s", user_id, e)
+                continue
+            if getattr(msg, "photo", None):
+                file_ids.append(msg.photo[-1].file_id)
+            try:
+                await bot.delete_message(chat_id=user_id, message_id=msg.message_id)
+            except Exception as e:
+                logger.debug("Upload: temp photo message not deleted: %s", e)
+
+        if not file_ids:
+            if rejected:
+                return _upload_error(400, "bad_file")
+            return _upload_error(502, "upload_failed")
+
+        from app.handlers.apartments import add_uploaded_photos
+
+        # Serialize FSM updates of one user (several uploads may run at once)
+        async with _user_lock(request.app, user_id):
+            result = await add_uploaded_photos(bot, request.app["storage"], user_id, file_ids)
+        if not isinstance(result, dict) or not result.get("ok"):
+            error = (result or {}).get("error") if isinstance(result, dict) else None
+            if error == "not_waiting":
+                return _upload_error(409, "not_waiting")
+            return _upload_error(400, error or "upload_failed")
+
+        logger.info(
+            "Mini app: user %s uploaded %s photo(s) (total %s)",
+            user_id, result.get("added"), result.get("total"),
+        )
+        return web.json_response({
+            "ok": True,
+            "added": int(result.get("added", 0)),
+            "total": int(result.get("total", 0)),
+            "min": int(result.get("min", minimum)),
+            "max": int(result.get("max", maximum)),
+        })
+    finally:
+        left = active.get(user_id, 1) - 1
+        if left > 0:
+            active[user_id] = left
+        else:
+            active.pop(user_id, None)
+            lock = request.app["upload_locks"].get(user_id)
+            if lock is not None and not lock.locked():
+                request.app["upload_locks"].pop(user_id, None)
+
+
+@web.middleware
+async def body_limit_middleware(request: web.Request, handler):
+    """Only the photo upload may send a big body; everything else stays at 64 KiB."""
+    if request.path != UPLOAD_PATH:
+        length = request.content_length
+        if length is not None and length > SMALL_BODY_LIMIT:
+            return json_error(413, "request body too large")
+    return await handler(request)
+
+
+# ---------------------------------------------------------------------------
 # Middleware + app factory
 # ---------------------------------------------------------------------------
 
@@ -850,21 +1101,32 @@ async def cors_middleware(request: web.Request, handler):
     return response
 
 
-def create_app(bot: Bot) -> web.Application:
-    """Create the aiohttp application for the mini app."""
+def create_app(bot: Bot, storage: Any = None) -> web.Application:
+    """Create the aiohttp application for the mini app.
+
+    ``storage`` is the dispatcher's FSM storage (needed by the photo upload).
+    """
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
     PHOTO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # cors first (outermost) so JSON error responses get the headers too
-    app = web.Application(middlewares=[cors_middleware, error_middleware], client_max_size=64 * 1024)
+    # cors first (outermost) so JSON error responses get the headers too.
+    # client_max_size fits the photo upload; body_limit_middleware keeps every
+    # other route at 64 KiB.
+    app = web.Application(
+        middlewares=[cors_middleware, error_middleware, body_limit_middleware],
+        client_max_size=UPLOAD_MAX_BODY,
+    )
     app["bot"] = bot
+    app["storage"] = storage
+    app["upload_active"] = {}
+    app["upload_locks"] = {}
     app.add_routes(routes)
     return app
 
 
-async def start_webapp(bot: Bot) -> Optional[web.AppRunner]:
+async def start_webapp(bot: Bot, storage: Any = None) -> Optional[web.AppRunner]:
     """Start the mini app web server. Returns None (and logs) if it cannot bind."""
-    app = create_app(bot)
+    app = create_app(bot, storage)
     runner = web.AppRunner(app)
     await runner.setup()
     host, port = settings.webapp_host, settings.webapp_port

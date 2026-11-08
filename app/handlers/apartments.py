@@ -6,19 +6,32 @@ sense (address detail, custom price, m², floor, description, phone) and the old
 labels are still understood (is_text) so a stale keyboard in the chat does no harm.
 The only reply keyboard left is Telegram's "share location" button at the location step.
 
-After a tap the step message loses its buttons (and shows the chosen value), callbacks whose
-state no longer matches are answered with a short "step is over" toast — so double taps and
-old buttons are harmless. Every handler takes ``lang`` (injected by LanguageMiddleware).
-The admin notification (notify_admins_new_apartment) stays Uzbek on purpose.
+Clean chat: every message of the flow (bot steps, hints, errors AND the user's own replies,
+photos, location, the "➕ E'lon qo'shish" trigger) is tracked in FSM 'lf_trash'. When a step is
+answered everything tracked so far is deleted (_purge), so the chat only shows the current step;
+the next step starts with a one-line recap of what was chosen. Received photos are deleted at
+once (their file_id is kept) and ONE status message is edited in place. Confirm / cancel delete
+everything and leave one result message + the main menu. Admin-import posts / summary are kept
+until the end ('lf_sticky').
+
+Photos can also come from the mini-app upload page ("📸 Rasm yuborish" = inline web_app button,
+app/webapp/server.py -> add_uploaded_photos()).
+
+Callbacks whose state no longer matches are answered with a short "step is over" toast — so
+double taps and old buttons are harmless. Every handler takes ``lang`` (injected by
+LanguageMiddleware). The admin notification (notify_admins_new_apartment) stays Uzbek on purpose.
 """
+import asyncio
 import html
 import math
-from typing import Optional
+from typing import Any, Awaitable, Callable, Dict, Iterable, Optional
 
-from aiogram import Router, F
+from aiogram import BaseMiddleware, Bot, Router, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import StateFilter
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.states import ApartmentStates, ImportStates
@@ -51,6 +64,9 @@ SKIPPABLE_STATES = (
     ApartmentStates.waiting_for_description,
 )
 
+# FSM state groups whose incoming messages belong to the listing / import flow
+FLOW_GROUPS = ("ApartmentStates", "ImportStates")
+
 
 def _type_key(data: dict) -> str:
     """'rent' or 'sale' (FSM data may hold the enum or its string value)."""
@@ -78,52 +94,188 @@ def _min_photos() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Clean chat: message tracking (FSM 'lf_trash') and deletion
+# ---------------------------------------------------------------------------
+
+def _ids(message_ids) -> list:
+    out = []
+    for m in message_ids:
+        try:
+            m = int(m)
+        except (TypeError, ValueError):
+            continue
+        if m > 0 and m not in out:
+            out.append(m)
+    return out
+
+
+async def _track(state: FSMContext, *message_ids) -> None:
+    """Remember message ids (bot steps AND user replies) to delete later (FSM 'lf_trash')."""
+    ids = _ids(message_ids)
+    if not ids:
+        return
+    data = await state.get_data()
+    trash = list(data.get('lf_trash') or [])
+    trash.extend(m for m in ids if m not in trash)
+    await state.update_data(lf_trash=trash)
+
+
+async def _track_sticky(state: FSMContext, *message_ids) -> None:
+    """Track ids that survive step-to-step purges and are deleted only at the end (import post / summary)."""
+    ids = _ids(message_ids)
+    if not ids:
+        return
+    await _track(state, *ids)
+    data = await state.get_data()
+    sticky = list(data.get('lf_sticky') or [])
+    sticky.extend(m for m in ids if m not in sticky)
+    await state.update_data(lf_sticky=sticky)
+
+
+async def _delete_ids(bot: Bot, chat_id: int, message_ids: Iterable[int]) -> None:
+    """Delete messages; missing / too old (> 48 h) ones are ignored. Never raises."""
+    ids = sorted(_ids(message_ids))
+    for start in range(0, len(ids), 100):
+        chunk = ids[start:start + 100]
+        if len(chunk) == 1:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=chunk[0])
+            except Exception:
+                pass
+            continue
+        try:
+            # deleteMessages silently skips messages that can't be found / deleted
+            await bot.delete_messages(chat_id=chat_id, message_ids=chunk)
+            continue
+        except Exception as e:
+            logger.debug(f"delete_messages failed in {chat_id}, deleting one by one: {e}")
+        for message_id in chunk:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except Exception:
+                pass
+
+
+async def _purge(bot: Bot, chat_id: int, state: FSMContext, keep: Iterable[int] = (), final: bool = False) -> None:
+    """Delete every tracked message except ``keep`` and clear the list.
+
+    final=False (a step was answered): the sticky ids (import post / summary) are kept as well.
+    Kept ids stay tracked, so the final purge (confirm / cancel) still removes them.
+    """
+    data = await state.get_data()
+    trash = list(data.get('lf_trash') or [])
+    kept = set(_ids(keep))
+    if not final:
+        kept |= set(_ids(data.get('lf_sticky') or []))
+    doomed = [m for m in trash if m not in kept]
+    update = {'lf_trash': [m for m in trash if m in kept]}
+    if final:
+        update['lf_sticky'] = []
+    await state.update_data(**update)
+    if doomed:
+        await _delete_ids(bot, chat_id, doomed)
+
+
+async def _say(message: Message, state: FSMContext, text: str, **kwargs) -> Message:
+    """message.answer() whose message is tracked (deleted when the next step is answered)."""
+    sent = await message.answer(text, **kwargs)
+    await _track(state, sent.message_id)
+    return sent
+
+
+class TrackFlowMessages(BaseMiddleware):
+    """Inner middleware (apartments + import routers): a message handled while a listing / import
+    state is active belongs to the flow -> tracked BEFORE the handler runs, so its purge removes it."""
+
+    async def __call__(
+        self,
+        handler: Callable[[Any, Dict[str, Any]], Awaitable[Any]],
+        event: Any,
+        data: Dict[str, Any],
+    ) -> Any:
+        state: Optional[FSMContext] = data.get("state")
+        raw_state = data.get("raw_state")
+        if (state is not None and isinstance(event, Message) and isinstance(raw_state, str)
+                and raw_state.split(":", 1)[0] in FLOW_GROUPS):
+            try:
+                await _track(state, event.message_id)
+            except Exception as e:  # tracking must never break the flow
+                logger.debug(f"Message tracking failed: {e}")
+        return await handler(event, data)
+
+
+router.message.middleware(TrackFlowMessages())
+
+
+def _recap(data: dict, lang: str) -> str:
+    """One line on top of each step: '✅ Ijaraga · 3 xonali · 8-mikrorayon · 4 350 000 so'm / oy' (HTML)."""
+    items = []
+    if data.get('type'):
+        items.append(t(lang, "listing.success_type_rent" if _type_key(data) == "rent" else "listing.success_type_sale"))
+    if data.get('rooms'):
+        items.append(t(lang, "listing.rooms_n", n=data['rooms']))
+    if data.get('address_area'):
+        items.append(area_label(data['address_area'], lang))
+    elif data.get('address'):
+        address = str(data['address'])
+        for city in variants("city"):
+            if address.startswith(city + ", "):
+                address = address[len(city) + 2:]
+                break
+        items.append(truncate_text(address, 40))
+    if data.get('price') is not None and data.get('currency'):
+        items.append(_price_text(data['price'], data['currency'], _type_key(data), lang))
+    if data.get('area'):
+        items.append(t(lang, "btn.area_m2", n=f"{data['area']:g}"))
+    if data.get('floor'):
+        floor = f"{data['floor']}/{data['total_floors']}" if data.get('total_floors') else str(data['floor'])
+        items.append(t(lang, "lf.recap_floor", floor=floor))
+    if not items:
+        return ""
+    return "<i>✅ " + html.escape(" · ".join(str(i) for i in items), quote=False) + "</i>"
+
+
+def _with_recap(data: dict, lang: str, text: str) -> str:
+    recap = _recap(data, lang)
+    return f"{recap}\n\n{text}" if recap else text
+
+
+# ---------------------------------------------------------------------------
 # Inline-step plumbing
 # ---------------------------------------------------------------------------
 
-async def _send_step(message: Message, state: FSMContext, text: str, keyboard, **extra) -> Message:
-    """Send a step prompt with its inline keyboard and remember it (lf_msg) so the buttons can be removed later."""
+async def _send_step(message: Message, state: FSMContext, text: str, keyboard,
+                     lang: Optional[str] = None, **extra) -> Message:
+    """Send a step prompt and remember it (lf_msg, tracked for deletion).
+
+    With ``lang`` the prompt starts with the recap line of what was chosen so far.
+    """
+    if lang:
+        text = _with_recap(await state.get_data(), lang, text)
     sent = await message.answer(text, reply_markup=keyboard, **extra)
     await state.update_data(lf_msg=sent.message_id)
+    await _track(state, sent.message_id)
     return sent
 
 
 async def _freeze_step(message: Message, state: FSMContext, except_id: Optional[int] = None):
-    """Remove the inline keyboard of the remembered step message (answer typed / step passed)."""
-    data = await state.get_data()
-    msg_id = data.get('lf_msg')
-    if not msg_id:
-        return
+    """The current step was answered (typed answer or tapped button): delete the step message, the
+    user's reply and everything else tracked so far (sticky import messages excepted)."""
     await state.update_data(lf_msg=None)
-    if msg_id == except_id:
-        return
-    try:
-        await message.bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=msg_id, reply_markup=None)
-    except Exception:
-        pass
+    await _purge(message.bot, message.chat.id, state)
 
 
 async def _choose(callback: CallbackQuery, state: FSMContext, lang: str, chosen: Optional[str] = None) -> Optional[Message]:
-    """A step button was tapped: show the chosen value on the step message and drop its buttons.
+    """A step button was tapped: the step message and the rest of the step's messages are deleted
+    (``chosen`` is shown by the next step's recap line instead).
 
     Returns the message to continue the dialogue with (None if Telegram gave no accessible message).
     """
     message = callback.message
     if not isinstance(message, Message):
         return None
-    done = False
-    if chosen is not None and message.text:
-        try:
-            await message.edit_text(f"{message.html_text}\n\n{t(lang, 'lf.chosen', value=html.escape(chosen))}")
-            done = True
-        except Exception:
-            pass
-    if not done:
-        try:
-            await message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-    await _freeze_step(message, state, except_id=message.message_id)
+    await _track(state, message.message_id)
+    await _freeze_step(message, state)
     return message
 
 
@@ -132,17 +284,17 @@ async def _choose(callback: CallbackQuery, state: FSMContext, lang: str, chosen:
 # ---------------------------------------------------------------------------
 
 async def _ask_type(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    await _send_step(message, state, t(lang, "listing.ask_type"), ApartmentKeyboard.inline_type(lang))
+    await _send_step(message, state, t(lang, "listing.ask_type"), ApartmentKeyboard.inline_type(lang), lang=lang)
     await state.set_state(ApartmentStates.waiting_for_type)
 
 
 async def _ask_rooms(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    await _send_step(message, state, t(lang, "listing.ask_rooms"), ApartmentKeyboard.inline_rooms(lang))
+    await _send_step(message, state, t(lang, "listing.ask_rooms"), ApartmentKeyboard.inline_rooms(lang), lang=lang)
     await state.set_state(ApartmentStates.waiting_for_rooms)
 
 
 async def _ask_address(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    await _send_step(message, state, t(lang, "listing.ask_address"), ApartmentKeyboard.inline_areas(lang))
+    await _send_step(message, state, t(lang, "listing.ask_address"), ApartmentKeyboard.inline_areas(lang), lang=lang)
     await state.set_state(ApartmentStates.waiting_for_address)
 
 
@@ -151,15 +303,15 @@ async def _ask_address_detail(message: Message, state: FSMContext, area: str, la
     await _send_step(
         message, state,
         t(lang, "listing.ask_address_detail", area=html.escape(area_label(area, lang))),
-        ApartmentKeyboard.inline_skip_cancel(lang),
+        ApartmentKeyboard.inline_skip_cancel(lang), lang=lang,
     )
     await state.set_state(ApartmentStates.waiting_for_address_detail)
 
 
 async def _ask_location(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
     """The one step with a reply keyboard (Telegram's location button); skip / cancel are inline."""
-    await message.answer(t(lang, "listing.ask_location"), reply_markup=ApartmentKeyboard.location_reply_keyboard(lang))
-    await _send_step(message, state, t(lang, "listing.location_or_skip"), ApartmentKeyboard.inline_skip_cancel(lang))
+    await _say(message, state, t(lang, "listing.ask_location"), reply_markup=ApartmentKeyboard.location_reply_keyboard(lang))
+    await _send_step(message, state, t(lang, "listing.location_or_skip"), ApartmentKeyboard.inline_skip_cancel(lang), lang=lang)
     await state.set_state(ApartmentStates.waiting_for_location)
 
 
@@ -167,25 +319,27 @@ async def _ask_price(message: Message, state: FSMContext, lang: str = DEFAULT_LA
     data = await state.get_data()
     type_key = _type_key(data)
     key = "listing.ask_price_rent" if type_key == "rent" else "listing.ask_price_sale"
-    await _send_step(message, state, t(lang, key), ApartmentKeyboard.inline_price(type_key, lang))
+    await _send_step(message, state, t(lang, key), ApartmentKeyboard.inline_price(type_key, lang), lang=lang)
     await state.set_state(ApartmentStates.waiting_for_price)
 
 
 async def _ask_area(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
     data = await state.get_data()
-    await _send_step(message, state, t(lang, "listing.ask_area"), ApartmentKeyboard.inline_m2(data.get('rooms'), lang))
+    await _send_step(message, state, t(lang, "listing.ask_area"), ApartmentKeyboard.inline_m2(data.get('rooms'), lang),
+                     lang=lang)
     await state.set_state(ApartmentStates.waiting_for_area)
 
 
 async def _ask_floor(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    await _send_step(message, state, t(lang, "listing.ask_floor"), ApartmentKeyboard.inline_floor(lang))
+    await _send_step(message, state, t(lang, "listing.ask_floor"), ApartmentKeyboard.inline_floor(lang), lang=lang)
     await state.set_state(ApartmentStates.waiting_for_floor)
 
 
 async def _ask_total_floors(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
     data = await state.get_data()
     await _send_step(
-        message, state, t(lang, "listing.ask_total_floors"), ApartmentKeyboard.inline_tf(data.get('floor'), lang)
+        message, state, t(lang, "listing.ask_total_floors"), ApartmentKeyboard.inline_tf(data.get('floor'), lang),
+        lang=lang,
     )
     await state.set_state(ApartmentStates.waiting_for_total_floors)
 
@@ -215,23 +369,38 @@ async def _ask_description(message: Message, state: FSMContext, lang: str = DEFA
     chips = await _send_step(
         message, state,
         t(lang, "listing.ask_description") + "\n\n" + t(lang, "listing.chips_hint"),
-        _description_tags_keyboard(type_key, [], lang),
+        _description_tags_keyboard(type_key, [], lang), lang=lang,
     )
     await state.update_data(desc_chips_msg=chips.message_id)
     await state.set_state(ApartmentStates.waiting_for_description)
 
 
+def _photos_text(data: dict, lang: str, count: int) -> str:
+    """Photos prompt = the ONE status message: recap + how to send + progress 'N/10' (once there are photos)."""
+    text = t(lang, "listing.ask_photos", min=_min_photos(), max=settings.photos_per_ad)
+    has_upload = bool(ApartmentKeyboard.photos_upload_url(lang))
+    text += "\n\n" + t(lang, "listing.photos_how_webapp" if has_upload else "listing.photos_how_clip")
+    if count:
+        minimum = _min_photos()
+        hint = (t(lang, "listing.photos_need_more", more=minimum - count) if count < minimum
+                else t(lang, "listing.photos_enough"))
+        text += "\n\n" + t(lang, "listing.photos_progress", n=count, max=settings.photos_per_ad, hint=hint)
+    return _with_recap(data, lang, text)
+
+
+def _photos_keyboard(count: int, lang: str):
+    """'📸 Rasm yuborish' (mini-app gallery upload) + '✅ Tayyor (N ta rasm)' + ❌."""
+    return ApartmentKeyboard.inline_photos(count, _min_photos(), settings.photos_per_ad, lang)
+
+
 async def _ask_photos(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    """Photos prompt; the photos already in the FSM (import / nothing) are counted in."""
+    """Photos prompt; it is also the status message edited in place after every photo.
+    The photos already in the FSM (import) are counted in."""
+    await state.update_data(lang=lang, photos_limit_msg=None)
     data = await state.get_data()
     count = len(data.get('photos') or [])
-    text = t(lang, "listing.ask_photos", min=_min_photos(), max=settings.photos_per_ad)
-    if count:
-        text += "\n\n" + t(lang, "listing.photos_have", n=count)
-    sent = await _send_step(
-        message, state, text, ApartmentKeyboard.inline_photos(count, _min_photos(), settings.photos_per_ad, lang)
-    )
-    await state.update_data(photos_status_msg=sent.message_id)
+    sent = await _send_step(message, state, _photos_text(data, lang, count), _photos_keyboard(count, lang))
+    await state.update_data(photos_status_msg=sent.message_id, photos_status_n=count)
     await state.set_state(ApartmentStates.waiting_for_photos)
 
 
@@ -263,7 +432,7 @@ async def _ask_import_phone(message: Message, state: FSMContext, lang: str = DEF
     await _send_step(
         message, state,
         t(lang, "listing.import_ask_phone"),
-        ApartmentKeyboard.inline_import_phone(data.get('admin_phone'), lang),
+        ApartmentKeyboard.inline_import_phone(data.get('admin_phone'), lang), lang=lang,
     )
     await state.set_state(ImportStates.waiting_for_phone)
 
@@ -283,14 +452,14 @@ async def _import_next_missing(message: Message, state: FSMContext, lang: str = 
         await _ask_address(message, state, lang)
     elif not _import_price_ok(data):
         if data.get('price') is not None:
-            await message.answer("⚠️ Topilgan narx tanlangan tur uchun mos emas, qaytadan kiriting.")
+            await _say(message, state, "⚠️ Topilgan narx tanlangan tur uchun mos emas, qaytadan kiriting.")
             await state.update_data(price=None)
         await _ask_price(message, state, lang)
     elif not data.get('phone_number'):
         await _ask_import_phone(message, state, lang)
     elif len(photos) < _min_photos():
         if photos:
-            await message.answer(t(lang, "listing.import_photos_more", k=len(photos), min=_min_photos()))
+            await _say(message, state, t(lang, "listing.import_photos_more", k=len(photos), min=_min_photos()))
         await _ask_photos(message, state, lang)
     else:
         await state.update_data(import_complete=True, editing=False)
@@ -328,15 +497,17 @@ async def _show_preview(message: Message, state: FSMContext, lang: str = DEFAULT
     keyboard = ApartmentKeyboard.inline_confirm(lang)
     try:
         sent = await message.answer_photo(photo=data['photos'][0], caption=preview, reply_markup=keyboard)
+        await _track(state, sent.message_id)
     except Exception as e:
         # Caption too long (e.g. emoji-heavy text): send photo and text separately
         logger.warning(f"Preview caption failed, sending separately: {e}")
         if data.get('photos'):
             try:
-                await message.answer_photo(photo=data['photos'][0])
+                photo_msg = await message.answer_photo(photo=data['photos'][0])
+                await _track(state, photo_msg.message_id)
             except Exception:
                 pass
-        sent = await message.answer(preview, reply_markup=keyboard)
+        sent = await _say(message, state, preview, reply_markup=keyboard)
     await state.update_data(lf_msg=sent.message_id)
     await state.set_state(ApartmentStates.confirm_apartment)
 
@@ -350,7 +521,7 @@ async def _next_or_preview(message: Message, state: FSMContext, next_step, lang:
         return
     if data.get('editing'):
         await state.update_data(editing=False, photos_backup=None, type_backup=None, floor_backup=None, address_backup=None)
-        await message.answer(t(lang, "listing.changed"), reply_markup=ReplyKeyboardRemove())
+        await _say(message, state, t(lang, "listing.changed"), reply_markup=ReplyKeyboardRemove())
         await _show_preview(message, state, lang)
     else:
         await next_step(message, state, lang)
@@ -364,6 +535,7 @@ async def _cancel_flow(message: Message, state: FSMContext, lang: str = DEFAULT_
         await _show_preview(message, state, lang)
         return
     if _import_in_progress(data):
+        await _purge(message.bot, message.chat.id, state, final=True)
         await state.clear()
         await message.answer(
             "❌ Import bekor qilindi.",
@@ -385,9 +557,11 @@ async def _cancel_flow(message: Message, state: FSMContext, lang: str = DEFAULT_
             old_floor, old_total = data['floor_backup']
             restore.update(floor=old_floor, total_floors=old_total, floor_backup=None)
         await state.update_data(**restore)
-        await message.answer(t(lang, "listing.change_cancelled"), reply_markup=ReplyKeyboardRemove())
+        await _say(message, state, t(lang, "listing.change_cancelled"), reply_markup=ReplyKeyboardRemove())
         await _show_preview(message, state, lang)
     else:
+        # The whole listing is dropped: every message of the flow goes, one short note + main menu stays
+        await _purge(message.bot, message.chat.id, state, final=True)
         await state.clear()
         await message.answer(
             t(lang, "listing.cancelled"),
@@ -426,7 +600,7 @@ async def cb_skip(callback: CallbackQuery, state: FSMContext, lang: str = DEFAUL
     if current == ApartmentStates.waiting_for_address_detail.state:
         await _set_address_detail(message, state, lang, None)
     elif current == ApartmentStates.waiting_for_location.state:
-        await message.answer(t(lang, "listing.location_skipped"), reply_markup=ReplyKeyboardRemove())
+        await _say(message, state, t(lang, "listing.location_skipped"), reply_markup=ReplyKeyboardRemove())
         await _set_location(message, state, lang, None, None)
     elif current == ApartmentStates.waiting_for_area.state:
         await _set_area(message, state, lang, None)
@@ -458,12 +632,15 @@ async def start_add_apartment(message: Message, state: FSMContext, session: Asyn
         await message.answer(t(lang, "listing.blocked", contact=_contact_admin(lang)))
         return
 
+    # A flow already running (restart): its messages go; this trigger message belongs to the new flow
+    await _purge(message.bot, message.chat.id, state, keep={message.message_id}, final=True)
     await state.clear()
 
-    await state.update_data(owner_id=user.id, phone_number=user.phone_number)
+    await state.update_data(owner_id=user.id, phone_number=user.phone_number, lang=lang)
+    await _track(state, message.message_id)
 
     # The form is inline from here on: hide the main-menu reply keyboard
-    await message.answer(t(lang, "listing.new"), reply_markup=ReplyKeyboardRemove())
+    await _say(message, state, t(lang, "listing.new"), reply_markup=ReplyKeyboardRemove())
     await _ask_type(message, state, lang)
 
 
@@ -479,7 +656,7 @@ async def _set_type(message: Message, state: FSMContext, lang: str, type_value: 
     # Type changed while editing and a price exists -> the price must be re-entered
     if data.get('editing') and data.get('price') and old_type and old_type != apartment_type.value:
         await state.update_data(type=apartment_type, type_backup=data.get('type'))
-        await message.answer(t(lang, "listing.type_changed"))
+        await _say(message, state, t(lang, "listing.type_changed"))
         await _ask_price(message, state, lang)
         return
 
@@ -506,7 +683,7 @@ async def process_apartment_type(message: Message, state: FSMContext, lang: str 
         return
     type_value = ApartmentKeyboard.type_from_text(message.text)
     if not type_value:
-        await message.answer(t(lang, "listing.type_invalid"))
+        await _say(message, state, t(lang, "listing.type_invalid"))
         return
     await _freeze_step(message, state)
     await _set_type(message, state, lang, type_value)
@@ -546,7 +723,7 @@ async def process_rooms(message: Message, state: FSMContext, lang: str = DEFAULT
         if rooms < 1 or rooms > 10:
             raise ValueError
     except ValueError:
-        await message.answer(t(lang, "listing.rooms_invalid"))
+        await _say(message, state, t(lang, "listing.rooms_invalid"))
         return
     await _freeze_step(message, state)
     await _set_rooms(message, state, lang, rooms)
@@ -564,7 +741,7 @@ async def _set_address(message: Message, state: FSMContext, lang: str, address: 
 async def _ask_full_address(message: Message, state: FSMContext, lang: str):
     """'✍️ Boshqa hudud': the whole address is typed (state stays waiting_for_address)."""
     await state.update_data(address_area=None)
-    await _send_step(message, state, t(lang, "listing.ask_full_address"), ApartmentKeyboard.inline_cancel(lang))
+    await _send_step(message, state, t(lang, "listing.ask_full_address"), ApartmentKeyboard.inline_cancel(lang), lang=lang)
 
 
 @router.callback_query(ApartmentStates.waiting_for_address, F.data.startswith("lf:area:"))
@@ -609,7 +786,7 @@ async def process_address(message: Message, state: FSMContext, lang: str = DEFAU
         return
 
     if len(text) < 5:
-        await message.answer(t(lang, "listing.address_invalid"))
+        await _say(message, state, t(lang, "listing.address_invalid"))
         return
 
     # Free text: add the city name if the user didn't (checked in every language)
@@ -638,7 +815,7 @@ async def process_address_detail(message: Message, state: FSMContext, lang: str 
     else:
         detail = (message.text or "").strip()
         if len(detail) < 2:
-            await message.answer(t(lang, "listing.address_detail_invalid"))
+            await _say(message, state, t(lang, "listing.address_detail_invalid"))
             return
     await _freeze_step(message, state)
     await _set_address_detail(message, state, lang, detail)
@@ -662,14 +839,14 @@ async def process_location(message: Message, state: FSMContext, lang: str = DEFA
     location = message.location or (message.venue.location if message.venue else None)
     if location:
         await _freeze_step(message, state)
-        await message.answer(t(lang, "listing.location_saved"), reply_markup=ReplyKeyboardRemove())
+        await _say(message, state, t(lang, "listing.location_saved"), reply_markup=ReplyKeyboardRemove())
         await _set_location(message, state, lang, location.latitude, location.longitude)
     elif is_text(message.text, "btn.skip"):
         await _freeze_step(message, state)
-        await message.answer(t(lang, "listing.location_skipped"), reply_markup=ReplyKeyboardRemove())
+        await _say(message, state, t(lang, "listing.location_skipped"), reply_markup=ReplyKeyboardRemove())
         await _set_location(message, state, lang, None, None)
     else:
-        await message.answer(t(lang, "listing.location_invalid"))
+        await _say(message, state, t(lang, "listing.location_invalid"))
 
 
 # ---------------------------------------------------------------------------
@@ -684,7 +861,7 @@ async def _set_price(message: Message, state: FSMContext, lang: str, amount, cur
     note = t(lang, "listing.price_guessed_usd") if guessed_usd else ""
     if (announce and not data.get('editing')) or note:
         shown = _price_text(amount, currency, type_key, lang)
-        await message.answer(t(lang, "listing.price_saved", price=shown, note=note))
+        await _say(message, state, t(lang, "listing.price_saved", price=shown, note=note))
     await _next_or_preview(message, state, _ask_area, lang)
 
 
@@ -729,7 +906,7 @@ async def process_price(message: Message, state: FSMContext, lang: str = DEFAULT
                 low=format_price(low, currency, lang=lang),
                 high=format_price(high, currency, lang=lang),
             )
-        await message.answer(t(lang, "listing.price_retry", reason=reason))
+        await _say(message, state, t(lang, "listing.price_retry", reason=reason))
         return
 
     await _freeze_step(message, state)
@@ -769,7 +946,7 @@ async def process_area(message: Message, state: FSMContext, lang: str = DEFAULT_
     else:
         area = ApartmentKeyboard.parse_area_text(message.text)
         if area is None or not math.isfinite(area) or area < 5 or area > 1000:
-            await message.answer(t(lang, "listing.area_invalid"))
+            await _say(message, state, t(lang, "listing.area_invalid"))
             return
     await _freeze_step(message, state)
     await _set_area(message, state, lang, area)
@@ -825,7 +1002,7 @@ async def process_floor(message: Message, state: FSMContext, lang: str = DEFAULT
             if not (1 <= floor <= 100):
                 raise ValueError
     except ValueError:
-        await message.answer(t(lang, "listing.floor_invalid"))
+        await _say(message, state, t(lang, "listing.floor_invalid"))
         return
 
     await _freeze_step(message, state)
@@ -865,7 +1042,7 @@ async def process_total_floors(message: Message, state: FSMContext, lang: str = 
     else:
         total_floors = ApartmentKeyboard.parse_total_floors_text(message.text)
         if total_floors is None or total_floors < max(floor, 1) or total_floors > 100:
-            await message.answer(t(lang, "listing.total_floors_invalid", floor=floor))
+            await _say(message, state, t(lang, "listing.total_floors_invalid", floor=floor))
             return
     await _freeze_step(message, state)
     await _set_total_floors(message, state, lang, total_floors)
@@ -882,16 +1059,8 @@ def _selected_tags(data: dict, lang: str) -> list:
 
 async def _finish_description(message: Message, state: FSMContext, lang: str, description: Optional[str]):
     data = await state.get_data()
+    # (the chips message is the step message: already deleted by _choose / _freeze_step)
     await state.update_data(description=description, desc_tags=None, desc_chips_msg=None)
-
-    # Freeze the chips message so old chips can't be tapped later
-    if data.get('desc_chips_msg') and data.get('desc_chips_msg') != message.message_id:
-        try:
-            await message.bot.edit_message_reply_markup(
-                chat_id=message.chat.id, message_id=data['desc_chips_msg'], reply_markup=None
-            )
-        except Exception:
-            pass
 
     if data.get('editing'):
         await _next_or_preview(message, state, _ask_photos, lang)
@@ -956,12 +1125,12 @@ async def process_description(message: Message, state: FSMContext, lang: str = D
     else:
         extra = (message.text or "").strip()
         if not extra:
-            await message.answer(t(lang, "listing.description_empty"))
+            await _say(message, state, t(lang, "listing.description_empty"))
             return
         description = " · ".join(tags) + ("\n" if tags else "") + extra
 
     if description and len(description) > settings.max_description_length:
-        await message.answer(
+        await _say(message, state, 
             t(lang, "listing.description_too_long", n=len(description), max=settings.max_description_length)
         )
         return
@@ -974,54 +1143,113 @@ async def process_description(message: Message, state: FSMContext, lang: str = D
 # Photos (at least settings.min_photos_per_ad, at most settings.photos_per_ad)
 # ---------------------------------------------------------------------------
 
-async def _photos_status(message: Message, state: FSMContext, lang: str, photos: list):
-    """One status message 'N/10 qabul qilindi' with the done button; edited after every photo."""
-    data = await state.get_data()
-    n, minimum, maximum = len(photos), _min_photos(), settings.photos_per_ad
-    hint = t(lang, "listing.photos_need_more", more=minimum - n) if n < minimum else t(lang, "listing.photos_enough")
-    text = t(lang, "listing.photos_progress", n=n, max=maximum, hint=hint)
-    keyboard = ApartmentKeyboard.inline_photos(n, minimum, maximum, lang)
+# One lock per user: Telegram photos (dispatcher) and mini-app uploads (web server, outside the
+# dispatcher's event isolation) must not interleave while the status message is edited.
+_photo_locks: Dict[int, asyncio.Lock] = {}
 
+
+def _photo_lock(user_id: int) -> asyncio.Lock:
+    lock = _photo_locks.get(user_id)
+    if lock is None:
+        if len(_photo_locks) > 5000:  # keep the dict small; idle locks are cheap to recreate
+            for uid in [u for u, l in _photo_locks.items() if not l.locked()]:
+                _photo_locks.pop(uid, None)
+        lock = _photo_locks[user_id] = asyncio.Lock()
+    return lock
+
+
+async def _refresh_photos_status(bot: Bot, chat_id: int, state: FSMContext, lang: str) -> None:
+    """Edit the ONE photos status message (prompt) to the current count 'N/10' + keyboard.
+
+    If it can't be edited (deleted, too old) a new one is sent — only while the photos step is active.
+    """
+    data = await state.get_data()
+    count = len(data.get('photos') or [])
     status_id = data.get('photos_status_msg')
-    if status_id and status_id != data.get('lf_msg'):
-        # A status message exists already (the prompt itself is never rewritten) -> edit it
+    if status_id and data.get('photos_status_n') == count:
+        return  # nothing changed ("message is not modified")
+    text = _photos_text(data, lang, count)
+    keyboard = _photos_keyboard(count, lang)
+    if status_id:
         try:
-            await message.bot.edit_message_text(
-                chat_id=message.chat.id, message_id=status_id, text=text, reply_markup=keyboard
-            )
+            await bot.edit_message_text(chat_id=chat_id, message_id=status_id, text=text, reply_markup=keyboard)
+            await state.update_data(photos_status_n=count)
             return
-        except Exception:
-            pass
-    # First photo (or the status message is gone): drop the prompt's buttons, send the status message
-    await _freeze_step(message, state)
-    sent = await message.answer(text, reply_markup=keyboard)
-    await state.update_data(photos_status_msg=sent.message_id)
+        except TelegramBadRequest as e:
+            if "not modified" in str(e).lower():
+                await state.update_data(photos_status_n=count)
+                return
+            # message gone / can't be edited any more -> a new status message below
+        except Exception as e:
+            # flood control / network: keep the old message; the next photo refreshes it
+            logger.debug(f"Photos status edit failed: {e}")
+            return
+    if await state.get_state() != ApartmentStates.waiting_for_photos.state:
+        return
+    sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+    await _track(state, sent.message_id)
+    await state.update_data(photos_status_msg=sent.message_id, lf_msg=sent.message_id, photos_status_n=count)
+    if status_id:
+        await _delete_ids(bot, chat_id, [status_id])
 
 
 @router.message(ApartmentStates.waiting_for_photos, F.photo)
 async def process_photo(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
-    """Collect photos; progress is shown by editing one status message."""
-    data = await state.get_data()
-    photos = list(data.get('photos') or [])
+    """Collect photos (file_id of the largest size); the photo message itself is deleted at once
+    and the progress is shown by editing the one status message."""
+    async with _photo_lock(message.chat.id):
+        if await state.get_state() != ApartmentStates.waiting_for_photos.state:
+            return  # "✅ Tayyor" / cancel won the race
+        data = await state.get_data()
+        photos = list(data.get('photos') or [])
+        accepted = len(photos) < settings.photos_per_ad
+        if accepted:
+            photos.append(message.photo[-1].file_id)
+            await state.update_data(photos=photos)
 
-    if len(photos) >= settings.photos_per_ad:
-        await message.answer(t(lang, "listing.photos_limit", max=settings.photos_per_ad))
-        return
+        # The photo is stored (or over the limit): its message is not needed in the chat.
+        # (It stays tracked: if this delete fails, e.g. flood control, the final purge retries it.)
+        await _delete_ids(message.bot, message.chat.id, [message.message_id])
 
-    photos.append(message.photo[-1].file_id)
-    await state.update_data(photos=photos)
-    await _photos_status(message, state, lang, photos)
+        if not accepted:
+            if not data.get('photos_limit_msg'):
+                warn = await _say(message, state, t(lang, "listing.photos_limit", max=settings.photos_per_ad))
+                await state.update_data(photos_limit_msg=warn.message_id)
+            return
+        await _refresh_photos_status(message.bot, message.chat.id, state, lang)
+
+
+async def add_uploaded_photos(bot: Bot, storage: BaseStorage, user_id: int, file_ids: list) -> dict:
+    """Photos uploaded from the mini-app page (app/webapp/server.py) -> the user's listing.
+
+    Only while the user is at the photos step (ApartmentStates.waiting_for_photos); file ids are
+    appended up to settings.photos_per_ad and the status message is refreshed like process_photo does.
+    Returns {"ok": True, "added", "total", "max", "min"} or {"ok": False, "error": "not_waiting"}.
+    """
+    key = StorageKey(bot_id=bot.id, chat_id=user_id, user_id=user_id)
+    state = FSMContext(storage=storage, key=key)
+    maximum, minimum = settings.photos_per_ad, _min_photos()
+    async with _photo_lock(user_id):
+        if await state.get_state() != ApartmentStates.waiting_for_photos.state:
+            return {"ok": False, "error": "not_waiting"}
+        data = await state.get_data()
+        lang = data.get('lang') or DEFAULT_LANG
+        photos = list(data.get('photos') or [])
+        room = max(0, maximum - len(photos))
+        new_ids = [f for f in (file_ids or []) if isinstance(f, str) and f][:room]
+        if new_ids:
+            photos.extend(new_ids)
+            await state.update_data(photos=photos)
+            try:
+                await _refresh_photos_status(bot, user_id, state, lang)
+            except Exception as e:  # the photos are stored; a failed status edit must not fail the upload
+                logger.warning(f"Photos status refresh after upload failed for {user_id}: {e}")
+        return {"ok": True, "added": len(new_ids), "total": len(photos), "max": maximum, "min": minimum}
 
 
 async def _finish_photos(message: Message, state: FSMContext, lang: str):
     data = await state.get_data()
-    status_id = data.get('photos_status_msg')
-    if status_id and status_id != message.message_id:
-        # Typed '✅ Tayyor': the status message still shows the done button -> drop it
-        try:
-            await message.bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=status_id, reply_markup=None)
-        except Exception:
-            pass
+    # (the status message is the step message: already deleted by _choose / _freeze_step)
     await state.update_data(
         editing=False, photos_backup=None, type_backup=None, floor_backup=None, address_backup=None,
         photos_status_msg=None,
@@ -1035,27 +1263,32 @@ async def _finish_photos(message: Message, state: FSMContext, lang: str):
 @router.callback_query(ApartmentStates.waiting_for_photos, F.data == "lf:photos_done")
 async def cb_photos_done(callback: CallbackQuery, state: FSMContext, lang: str = DEFAULT_LANG):
     """'✅ Tayyor' -> preview (refused while there are fewer than the minimum photos)."""
-    data = await state.get_data()
-    count = len(data.get('photos') or [])
-    if count < _min_photos():
-        await callback.answer(t(lang, "listing.photos_required", n=_min_photos(), k=count), show_alert=True)
-        return
-    await callback.answer()
-    message = await _choose(callback, state, lang)
-    if message:
-        await _finish_photos(message, state, lang)
+    async with _photo_lock(callback.from_user.id):  # waits for a mini-app upload in progress
+        data = await state.get_data()
+        count = len(data.get('photos') or [])
+        if await state.get_state() != ApartmentStates.waiting_for_photos.state:
+            await callback.answer(t(lang, "lf.stale"))
+            return
+        if count < _min_photos():
+            await callback.answer(t(lang, "listing.photos_required", n=_min_photos(), k=count), show_alert=True)
+            return
+        await callback.answer()
+        message = await _choose(callback, state, lang)
+        if message:
+            await _finish_photos(message, state, lang)
 
 
 @router.message(ApartmentStates.waiting_for_photos, F.text.in_(variants("btn.done")))
 async def photos_done(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
     """Typed '✅ Tayyor' (old reply keyboard)."""
-    data = await state.get_data()
-    count = len(data.get('photos') or [])
-    if count < _min_photos():
-        await message.answer(t(lang, "listing.photos_required", n=_min_photos(), k=count))
-        return
-    await _freeze_step(message, state)
-    await _finish_photos(message, state, lang)
+    async with _photo_lock(message.chat.id):
+        data = await state.get_data()
+        count = len(data.get('photos') or [])
+        if count < _min_photos():
+            await _say(message, state, t(lang, "listing.photos_required", n=_min_photos(), k=count))
+            return
+        await _freeze_step(message, state)
+        await _finish_photos(message, state, lang)
 
 
 @router.message(ApartmentStates.waiting_for_photos)
@@ -1063,7 +1296,7 @@ async def invalid_photo_input(message: Message, state: FSMContext, lang: str = D
     """Handle anything else during photo upload."""
     if await _handle_cancel(message, state, lang):
         return
-    await message.answer(t(lang, "listing.photos_invalid"))
+    await _say(message, state, t(lang, "listing.photos_invalid"))
 
 
 # ---------------------------------------------------------------------------
@@ -1101,6 +1334,9 @@ async def _save_listing(message: Message, state: FSMContext, session: AsyncSessi
             # The admin posted it -> published at once, no admin notification
             await ApartmentService.approve_apartment(session, apartment)
 
+        # Clean chat: everything of the flow goes (preview, replies, photos, trigger, import post);
+        # only the result message below (+ main menu) stays
+        await _purge(message.bot, message.chat.id, state, final=True)
         await state.clear()
 
         is_rent = apartment.type == ApartmentType.RENT
@@ -1135,6 +1371,10 @@ async def _save_listing(message: Message, state: FSMContext, session: AsyncSessi
 
     except Exception as e:
         logger.error(f"Error creating apartment: {e}")
+        try:
+            await _purge(message.bot, message.chat.id, state, final=True)
+        except Exception:
+            pass
         await message.answer(
             t(lang, "listing.save_error"),
             reply_markup=MainKeyboard.get_main_menu(is_registered=True, lang=lang)
@@ -1143,7 +1383,7 @@ async def _save_listing(message: Message, state: FSMContext, session: AsyncSessi
 
 
 async def _open_edit_menu(message: Message, state: FSMContext, lang: str):
-    await _send_step(message, state, t(lang, "listing.edit_menu"), ApartmentKeyboard.inline_edit_fields(lang))
+    await _send_step(message, state, t(lang, "listing.edit_menu"), ApartmentKeyboard.inline_edit_fields(lang), lang=lang)
     await state.set_state(ApartmentStates.choosing_edit_field)
 
 
@@ -1173,7 +1413,7 @@ async def confirm_apartment(message: Message, state: FSMContext, session: AsyncS
         await _open_edit_menu(message, state, lang)
         return
     if not is_text(message.text, "btn.confirm"):
-        await message.answer(t(lang, "listing.confirm_invalid"))
+        await _say(message, state, t(lang, "listing.confirm_invalid"))
         return
     await _freeze_step(message, state)
     await _save_listing(message, state, session, lang)
@@ -1198,7 +1438,7 @@ async def _start_edit(message: Message, state: FSMContext, lang: str, field: str
     if field == "photos":
         # Keep old photos so "❌ Bekor qilish" can restore them
         await state.update_data(photos_backup=data.get('photos', []), photos=[])
-        await message.answer(t(lang, "listing.replace_photos"))
+        await _say(message, state, t(lang, "listing.replace_photos"))
 
     prompts = {
         "type": _ask_type,
@@ -1242,7 +1482,7 @@ async def choose_edit_field(message: Message, state: FSMContext, lang: str = DEF
         return
     field = ApartmentKeyboard.edit_field_from_text(message.text)
     if not field:
-        await message.answer(t(lang, "listing.edit_field_invalid"))
+        await _say(message, state, t(lang, "listing.edit_field_invalid"))
         return
     await _freeze_step(message, state)
     await _start_edit(message, state, lang, field)

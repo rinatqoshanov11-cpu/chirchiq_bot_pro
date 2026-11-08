@@ -85,7 +85,7 @@ async def main():
     # Mini app web server (same process); a busy port never stops the bot
     webapp_runner = None
     if settings.webapp_enabled:
-        webapp_runner = await start_webapp(bot)
+        webapp_runner = await start_webapp(bot, storage=dp.storage)
     else:
         logger.info("Mini app web server is disabled")
 

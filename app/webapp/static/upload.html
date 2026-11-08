@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="uz">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="format-detection" content="telephone=no">
+  <title>Rasm yuborish</title>
+  <!-- Telegram Web App SDK: self-hosted copy (telegram.org is unreachable on some networks) -->
+  <script src="/static/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="/static/upload.css">
+</head>
+<body>
+  <main class="up">
+    <header class="up-head">
+      <span class="up-logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="15" rx="3"/><circle cx="9" cy="11" r="2"/><path d="m21 17-5-5-8 8"/></svg>
+      </span>
+      <div>
+        <h1 class="up-title" id="t-title" data-i18n="title">Rasm yuborish</h1>
+        <p class="up-sub" id="t-sub"></p>
+      </div>
+    </header>
+
+    <p class="up-note" id="note" hidden></p>
+
+    <input id="file" class="up-file" type="file" accept="image/*" multiple tabindex="-1" aria-hidden="true">
+
+    <button id="pick" class="up-pick" type="button">
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="15" rx="3"/><circle cx="9" cy="11" r="2"/><path d="m21 17-5-5-8 8"/></svg>
+      <span id="pick-text" data-i18n="pick">Galereyadan tanlash</span>
+    </button>
+
+    <div class="up-progress" id="progress" hidden>
+      <div class="up-bar"><div class="up-bar-fill" id="bar"></div></div>
+      <p class="up-progress-text" id="progress-text" aria-live="polite"></p>
+    </div>
+
+    <ul class="up-grid" id="grid" aria-live="polite"></ul>
+
+    <div class="up-result" id="result" role="status" hidden></div>
+  </main>
+  <script src="/static/upload.js"></script>
+</body>
+</html>

@@ -35,6 +35,18 @@ def webapp_url_for(lang: str = DEFAULT_LANG) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
+def upload_url_for(lang: str = DEFAULT_LANG) -> str:
+    """Mini-app photo upload page: <webapp base>/upload?lang=<lang>; '' unless WEBAPP_URL is https."""
+    url = (settings.webapp_url or "").strip()
+    if not url.startswith("https://"):
+        return ""
+    if lang not in LANGS:
+        lang = DEFAULT_LANG
+    parts = urlsplit(url)
+    path = parts.path.rstrip("/") + "/upload"
+    return urlunsplit((parts.scheme, parts.netloc, path, urlencode([("lang", lang)]), ""))
+
+
 def _fmt_usd(value: int) -> str:
     return "$" + f"{value:,}".replace(",", " ")
 
@@ -470,10 +482,29 @@ class ApartmentKeyboard:
         return builder.as_markup()
 
     @staticmethod
+    def photos_upload_url(lang: str = DEFAULT_LANG) -> str:
+        """URL of the mini-app gallery upload page ('' when WEBAPP_URL is not https)."""
+        return upload_url_for(lang)
+
+    @staticmethod
     def inline_photos(count: int, minimum: int, maximum: int, lang: str = DEFAULT_LANG) -> InlineKeyboardMarkup:
-        """'✅ Tayyor (N ta rasm)' once enough photos were sent, before that 'yana N ta kerak'."""
+        """Photos step.
+
+        With the mini app (https WEBAPP_URL): '📸 Rasm yuborish' (web_app button -> upload page that
+        opens the phone gallery) + '✅ Tayyor (N ta rasm)' ('⏳ Tayyor (N/3)' look while too few;
+        tapping it then shows the refusal alert) + ❌.
+        Without it: '✅ Tayyor (N ta rasm)' once enough photos were sent, before that 'yana N ta kerak'.
+        """
         builder = InlineKeyboardBuilder()
-        if count >= minimum:
+        upload_url = upload_url_for(lang)
+        if upload_url:
+            if count < maximum:
+                builder.button(text=t(lang, "lf.photos_send"), web_app=WebAppInfo(url=upload_url))
+            if count >= minimum:
+                builder.button(text=t(lang, "lf.photos_done", n=count), callback_data="lf:photos_done")
+            else:
+                builder.button(text=t(lang, "lf.photos_done_wait", n=count, min=minimum), callback_data="lf:photos_done")
+        elif count >= minimum:
             builder.button(text=t(lang, "lf.photos_done", n=count), callback_data="lf:photos_done")
         else:
             builder.button(text=t(lang, "lf.photos_need", more=minimum - count), callback_data="lf:photos_done")

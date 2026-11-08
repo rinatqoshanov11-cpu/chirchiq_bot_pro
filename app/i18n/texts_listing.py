@@ -328,6 +328,16 @@ TEXTS = {
               "At least <b>{min}</b>, at most {max} photos. You can send several at once.\n"
               "When you're done, tap «✅ Done».",
     },
+    "listing.photos_how_webapp": {
+        "uz": "👇 «📸 Rasm yuborish» tugmasi galereyani ochadi — yoki rasmlarni 📎 orqali yuboring.",
+        "ru": "👇 Кнопка «📸 Отправить фото» откроет галерею — или отправьте фото через 📎.",
+        "en": "👇 The «📸 Send photos» button opens your gallery — or send photos via 📎.",
+    },
+    "listing.photos_how_clip": {
+        "uz": "📎 tugmasi orqali rasmlarni yuboring.",
+        "ru": "Отправьте фото через 📎.",
+        "en": "Send the photos via 📎.",
+    },
     "listing.photos_have": {
         "uz": "Hozir: <b>{n} ta</b> rasm bor.",
         "ru": "Сейчас: <b>{n}</b> фото.",

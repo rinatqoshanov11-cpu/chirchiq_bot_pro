@@ -29,6 +29,24 @@ TEXTS = {
         "ru": "✅ Готово ({n} фото)",
         "en": "✅ Done ({n} photos)",
     },
+    # Photos step (mini app available): the "done" button while there are not enough photos yet
+    "lf.photos_done_wait": {
+        "uz": "⏳ Tayyor ({n}/{min})",
+        "ru": "⏳ Готово ({n}/{min})",
+        "en": "⏳ Done ({n}/{min})",
+    },
+    # Photos step: inline web_app button -> mini-app upload page (opens the phone gallery)
+    "lf.photos_send": {
+        "uz": "📸 Rasm yuborish",
+        "ru": "📸 Отправить фото",
+        "en": "📸 Send photos",
+    },
+    # Recap line on top of each step: the floor item
+    "lf.recap_floor": {
+        "uz": "{floor}-qavat",
+        "ru": "{floor} этаж",
+        "en": "floor {floor}",
+    },
     # Import: use the admin's own phone number
     "lf.phone_self": {
         "uz": "📱 O'zimning raqamim: {phone}",
