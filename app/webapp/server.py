@@ -10,9 +10,15 @@ All error responses are JSON ``{"error": "..."}``; a traceback never reaches
 the client. Text fields are returned raw (not HTML-escaped) - the frontend
 must insert them with ``textContent``.
 
-Language: every listing endpoint localizes ``type_text``, ``status_text`` and
-``price_text``. The language comes from the ``lang`` query parameter
-(``uz`` | ``ru`` | ``en``), else the ``X-Lang`` header, else Uzbek.
+Language: every listing endpoint localizes ``type_text``, ``status_text``,
+``price_text``, ``title`` and ``city``. The language comes from the ``lang``
+query parameter (``uz`` | ``ru`` | ``en``), else the ``X-Lang`` header, else Uzbek.
+
+Catalog search (``GET /api/listings``): ``rooms`` is ``1..6`` or ``4plus``
+(4 rooms or more); ``q`` is free text - every word (max 5, each cut to 40
+chars) must appear in the address, description or district (ILIKE), and a
+digits-only word also matches the room count. ``GET /api/listings/batch?ids=``
+returns up to 50 public listings in the requested order (favorites).
 """
 from __future__ import annotations
 
@@ -21,18 +27,19 @@ import hashlib
 import inspect
 import logging
 import os
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from aiogram import Bot
 from aiogram.utils.web_app import WebAppUser, safe_parse_webapp_init_data
 from aiohttp import web
-from sqlalchemy import and_, func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.i18n import DEFAULT_LANG, LANGS, t
+from app.i18n import DEFAULT_LANG, LANGS, t, variants
 from app.models import Apartment, User
 from app.models.apartment import ApartmentStatus, ApartmentType
 from app.models.base import async_session_maker
@@ -52,7 +59,27 @@ LANG_HEADER = "X-Lang"
 DEFAULT_LIMIT = 12
 MAX_LIMIT = 30
 MAX_ROOMS = 6  # "6" in the API means 6 rooms or more
+ROOMS_PLUS = {"4plus": 4}  # rooms=4plus -> rooms >= 4 (the "4+ xona" chip)
 MAX_PARALLEL_DOWNLOADS = 4
+
+# Free-text search (?q=): at most this many words, each cut to this many chars
+MAX_SEARCH_WORDS = 5
+MAX_SEARCH_WORD_LEN = 40
+LIKE_ESCAPE = "\\"
+
+# /api/listings/batch?ids=1,2,3
+MAX_BATCH_IDS = 50
+
+# Listing "title": first line of the description, cut at a word boundary
+TITLE_MAX_LEN = 70
+_TITLE_FALLBACK = {
+    "uz": "{rooms} xonali kvartira",
+    "ru": "{rooms}-комн. квартира",
+    "en": "{rooms}-room apartment",
+}
+_TITLE_FALLBACK_NO_ROOMS = {"uz": "Kvartira", "ru": "Квартира", "en": "Apartment"}
+# Leading characters kept in a title even though they are not letters/digits
+_TITLE_OPENERS = "\"'«„“‘([¿¡"
 
 TYPE_TEXT = {
     ApartmentType.RENT: {"uz": "Ijaraga", "ru": "Аренда", "en": "For rent"},
@@ -140,6 +167,129 @@ def _loaded_owner(apartment: Apartment) -> Optional[User]:
     return apartment.__dict__.get("owner")
 
 
+def _strip_leading_symbols(text: str) -> str:
+    """Drop leading emojis / symbols / decorations ("🔥🔥 Srochno" -> "Srochno").
+
+    Letters, digits and a few opening punctuation marks stop the stripping.
+    """
+    index = 0
+    for index, char in enumerate(text):
+        if char.isalnum() or char in _TITLE_OPENERS:
+            return text[index:]
+    return ""
+
+
+def _cut_at_word(text: str, limit: int) -> str:
+    """Cut ``text`` to at most ``limit`` chars at a word boundary (+ an ellipsis)."""
+    if len(text) <= limit:
+        return text
+    head = text[: limit - 1]  # leave room for the ellipsis
+    if " " in head and not text[limit - 1].isspace():
+        head = head[: head.rfind(" ")]
+    head = head.rstrip(" ,;:-–—.!?/\\|")
+    if not head:  # one giant word
+        head = text[: limit - 1]
+    return head + "…"
+
+
+def listing_title(description: Optional[str], rooms: Optional[int], lang: str = DEFAULT_LANG) -> str:
+    """Card title: the first line of the description (no leading emojis, <= 70 chars).
+
+    Falls back to a localized "N xonali kvartira" when there is no usable text.
+    Safe for None / emoji-only / very long descriptions.
+    """
+    if lang not in LANGS:
+        lang = DEFAULT_LANG
+    text = ""
+    if isinstance(description, str):
+        for line in description.splitlines():
+            candidate = _strip_leading_symbols(" ".join(line.split()))
+            if candidate:
+                text = candidate
+                break
+    if text:
+        return _cut_at_word(text, TITLE_MAX_LEN)
+    if rooms:
+        return _TITLE_FALLBACK[lang].format(rooms=rooms)
+    return _TITLE_FALLBACK_NO_ROOMS[lang]
+
+
+def _city_aliases() -> set:
+    """Lower-case spellings of the city that may start an address."""
+    names = {name.casefold() for name in variants("city")}
+    names.update({"chirchiq", "chirchik", "чирчик"})
+    return names
+
+
+_CITY_ALIASES = _city_aliases()
+
+
+def area_name(address: Optional[str]) -> Optional[str]:
+    """The area part of an address: "Chirchiq, 8-mikrorayon, Navoiy 12" -> "8-mikrorayon".
+
+    The text after "<city>, " up to the next comma; None when the address does not
+    start with the city or has nothing after it ("Chirchiq" -> None).
+    """
+    if not address or not isinstance(address, str):
+        return None
+    parts = [part.strip() for part in address.split(",")]
+    if len(parts) < 2:
+        return None
+    city = parts[0].casefold()
+    for suffix in (" shahri", " sh.", " sh", " city", " г.", " город"):
+        if city.endswith(suffix):
+            city = city[: -len(suffix)].strip()
+            break
+    if city not in _CITY_ALIASES:
+        return None
+    area = " ".join(parts[1].split())
+    return area or None
+
+
+def _search_words(raw: Optional[str]) -> List[str]:
+    """Split a ?q= value into search words (max MAX_SEARCH_WORDS, each cut to 40 chars)."""
+    if not raw:
+        return []
+    words = []
+    for word in raw.split():
+        word = word[:MAX_SEARCH_WORD_LEN]
+        if word and word not in words:
+            words.append(word)
+        if len(words) >= MAX_SEARCH_WORDS:
+            break
+    return words
+
+
+def _like_pattern(word: str) -> str:
+    """'%word%' with the LIKE wildcards of the user's text escaped."""
+    escaped = (
+        word.replace(LIKE_ESCAPE, LIKE_ESCAPE + LIKE_ESCAPE)
+        .replace("%", LIKE_ESCAPE + "%")
+        .replace("_", LIKE_ESCAPE + "_")
+    )
+    return f"%{escaped}%"
+
+
+def search_conditions(words: List[str]):
+    """SQL conditions for free-text search: every word must match (AND across words).
+
+    A word matches when it appears (case-insensitively) in the address, the
+    description or the district; a digits-only word also matches the room count.
+    """
+    conditions = []
+    for word in words:
+        pattern = _like_pattern(word)
+        options = [
+            Apartment.address.ilike(pattern, escape=LIKE_ESCAPE),
+            Apartment.description.ilike(pattern, escape=LIKE_ESCAPE),
+            Apartment.district.ilike(pattern, escape=LIKE_ESCAPE),
+        ]
+        if word.isascii() and word.isdigit() and len(word) <= 2 and int(word) > 0:
+            options.append(Apartment.rooms == int(word))
+        conditions.append(or_(*options))
+    return conditions
+
+
 def listing_to_dict(
     apartment: Apartment, include_private: bool = False, lang: str = DEFAULT_LANG
 ) -> dict:
@@ -168,11 +318,14 @@ def listing_to_dict(
         "id": apartment.id,
         "type": apartment_type.value,
         "type_text": TYPE_TEXT[apartment_type][lang],
+        "title": listing_title(apartment.description, apartment.rooms, lang),
         "rooms": apartment.rooms,
         "area": apartment.area,
         "floor": apartment.floor,
         "total_floors": apartment.total_floors,
         "address": apartment.address or "",
+        "city": t(lang, "city"),
+        "area_name": area_name(apartment.address),
         "district": apartment.district,
         "latitude": apartment.latitude,
         "longitude": apartment.longitude,
@@ -390,7 +543,13 @@ async def api_listings(request: web.Request) -> web.Response:
     if type_param not in ("all", "rent", "sale"):
         raise ApiError(400, "invalid type")
 
-    rooms = _parse_int(q.get("rooms"), "rooms", minimum=1, maximum=MAX_ROOMS)
+    rooms_raw = (q.get("rooms") or "").strip().lower()
+    rooms_min = ROOMS_PLUS.get(rooms_raw)
+    rooms = None
+    if rooms_min is None:
+        rooms = _parse_int(rooms_raw, "rooms", minimum=1, maximum=MAX_ROOMS)
+
+    search_words = _search_words(q.get("q"))
 
     currency = q.get("currency")
     if currency:
@@ -417,11 +576,14 @@ async def api_listings(request: web.Request) -> web.Response:
     ]
     if type_param != "all":
         conditions.append(Apartment.type == ApartmentType(type_param))
-    if rooms is not None:
+    if rooms_min is not None:
+        conditions.append(Apartment.rooms >= rooms_min)
+    elif rooms is not None:
         if rooms >= MAX_ROOMS:
             conditions.append(Apartment.rooms >= MAX_ROOMS)
         else:
             conditions.append(Apartment.rooms == rooms)
+    conditions.extend(search_conditions(search_words))
     if currency is not None:
         conditions.append(Apartment.currency == currency)
         # Price bounds only make sense inside one currency
@@ -456,6 +618,47 @@ async def api_listings(request: web.Request) -> web.Response:
     return web.json_response(
         {"items": items, "total": total, "offset": offset, "limit": limit}
     )
+
+
+def _parse_ids(raw: Optional[str]) -> List[int]:
+    """``ids=1,2,3`` -> [1, 2, 3] (order kept, duplicates dropped); 400 when malformed."""
+    tokens = [token.strip() for token in (raw or "").split(",")]
+    tokens = [token for token in tokens if token]
+    if len(tokens) > MAX_BATCH_IDS:
+        raise ApiError(400, "too many ids")
+    ids: List[int] = []
+    for token in tokens:
+        if not (token.isascii() and token.isdigit()) or len(token) > 12:
+            raise ApiError(400, "invalid ids")
+        value = int(token)
+        if value > 0 and value not in ids:
+            ids.append(value)
+    return ids
+
+
+# Registered before "/api/listings/{id}" so that "batch" is not taken for an id
+@routes.get("/api/listings/batch")
+async def api_listings_batch(request: web.Request) -> web.Response:
+    """Listings by id (the favorites tab): approved + active only, in the requested order."""
+    lang = request_lang(request)
+    ids = _parse_ids(request.query.get("ids"))
+    if not ids:
+        return web.json_response({"items": []})
+
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(Apartment)
+            .options(selectinload(Apartment.owner))
+            .where(
+                Apartment.id.in_(ids),
+                Apartment.is_active == True,  # noqa: E712
+                Apartment.status == ApartmentStatus.APPROVED,
+            )
+        )
+        found = {a.id: a for a in result.scalars().all()}
+        items = [listing_to_dict(found[i], lang=lang) for i in ids if i in found]
+
+    return web.json_response({"items": items})
 
 
 @routes.get("/api/listings/{id}")
@@ -588,6 +791,9 @@ async def api_me(request: web.Request) -> web.Response:
             "registered": bool(user is not None and user.is_registered),
             "full_name": user.full_name if user is not None else None,
             "is_admin": _is_admin(user, tg_user.id),
+            "phone_number": user.phone_number if user is not None else None,
+            # From the signed initData (what Telegram says now), else what we stored
+            "username": tg_user.username or (user.username if user is not None else None),
         }
     return web.json_response(payload)
 

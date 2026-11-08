@@ -411,6 +411,7 @@ class InlineKeyboards:
         builder.button(text="👥 Foydalanuvchilar", callback_data="admin_users")
         builder.button(text="📊 Statistika", callback_data="admin_stats")
         builder.button(text="📢 Xabar yuborish", callback_data="admin_broadcast")
+        builder.button(text="📥 E'lon import qilish", callback_data="admin_import")
         builder.adjust(1)
         return builder.as_markup()
 

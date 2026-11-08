@@ -15,54 +15,174 @@
 
     <!-- ===== Catalog ===== -->
     <section id="view-catalog" class="view" data-view="catalog">
+      <div class="appbar">
+        <h1 class="brand">
+          <span class="logo" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V9.5"/></svg>
+          </span>
+          <span class="wordmark">Chirchiq Kvartira</span>
+        </h1>
+        <span class="brand-user" id="brand-user"></span>
+      </div>
       <header class="topbar">
-        <div class="topbar-row">
-          <h1 class="topbar-title">Chirchiq Kvartira</h1>
-        </div>
-        <div class="segmented" id="type-segment" role="tablist" aria-label="E'lon turi" data-i18n-aria="seg.label">
-          <button type="button" class="segmented-btn is-active" data-type="all" role="tab" aria-selected="true" data-i18n="seg.all">Hammasi</button>
-          <button type="button" class="segmented-btn" data-type="rent" role="tab" aria-selected="false" data-i18n="seg.rent">Ijaraga</button>
-          <button type="button" class="segmented-btn" data-type="sale" role="tab" aria-selected="false" data-i18n="seg.sale">Sotuv</button>
-        </div>
-        <div class="toolbar">
-          <button type="button" class="chip chip-filter" id="filter-btn" aria-haspopup="dialog">
-            <svg class="chip-icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M3 5h18v2l-7 7v5l-4 2v-7L3 7V5z"/></svg>
-            <span data-i18n="filter.button">Filtr</span>
-            <span class="chip-badge" id="filter-count" hidden>0</span>
+        <div class="searchbar">
+          <svg class="search-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          <input id="search-input" class="search-input" type="search" inputmode="search" enterkeyhint="search"
+                 autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" maxlength="120"
+                 placeholder="Qidirish: mavze, xona, narx..." data-i18n-placeholder="search.placeholder"
+                 aria-label="Qidirish" data-i18n-aria="search.label">
+          <button type="button" class="search-clear" id="search-clear" aria-label="Tozalash" data-i18n-aria="search.clear" hidden>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m15 9-6 6M9 9l6 6"/></svg>
           </button>
-          <span class="result-count" id="result-count" aria-live="polite"></span>
+          <span class="search-sep" aria-hidden="true"></span>
+          <button type="button" class="filter-btn" id="filter-btn" aria-haspopup="dialog" aria-label="Filtr" data-i18n-aria="filter.button" title="Filtr" data-i18n-title="filter.button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>
+            <span class="filter-badge" id="filter-count" hidden>0</span>
+          </button>
+        </div>
+        <div class="chips-row" id="rooms-chips" role="group" aria-label="Xonalar soni" data-i18n-aria="filter.rooms">
+          <button type="button" class="chip is-active" data-rooms="" aria-pressed="true" data-i18n="chip.all">Hammasi</button>
+          <button type="button" class="chip" data-rooms="1" aria-pressed="false" data-i18n="chip.r1">1 xona</button>
+          <button type="button" class="chip" data-rooms="2" aria-pressed="false" data-i18n="chip.r2">2 xona</button>
+          <button type="button" class="chip" data-rooms="3" aria-pressed="false" data-i18n="chip.r3">3 xona</button>
+          <button type="button" class="chip" data-rooms="4plus" aria-pressed="false" data-i18n="chip.r4">4+ xona</button>
         </div>
       </header>
 
-      <div class="list" id="catalog-list"></div>
+      <div class="list-head">
+        <span class="result-count" id="result-count" aria-live="polite"></span>
+        <button type="button" class="sort-btn" id="sort-btn" aria-haspopup="dialog">
+          <span id="sort-label">Eng yangi</span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
+      </div>
+
+      <div class="grid" id="catalog-list"></div>
       <div class="load-more" id="catalog-more" hidden>
         <button type="button" class="btn btn-secondary" id="catalog-more-btn" data-i18n="catalog.more">Yana ko'rsatish</button>
       </div>
       <div id="catalog-sentinel" class="sentinel" aria-hidden="true"></div>
     </section>
 
-    <!-- ===== My listings ===== -->
-    <section id="view-my" class="view" data-view="my" hidden>
-      <header class="topbar">
+    <!-- ===== Favorites ===== -->
+    <section id="view-favs" class="view" data-view="favs" hidden>
+      <header class="topbar topbar-simple">
         <div class="topbar-row">
-          <h1 class="topbar-title" data-i18n="my.title">Mening e'lonlarim</h1>
+          <h1 class="page-title" data-i18n="favs.title">Sevimlilar</h1>
+          <span class="result-count" id="favs-count"></span>
+        </div>
+      </header>
+      <div class="grid" id="favs-list"></div>
+    </section>
+
+    <!-- ===== Add listing ===== -->
+    <section id="view-add" class="view" data-view="add" hidden>
+      <header class="topbar topbar-simple">
+        <div class="topbar-row">
+          <h1 class="page-title" data-i18n="add.title">E'lon berish</h1>
+        </div>
+      </header>
+      <div class="add-wrap">
+        <div class="add-hero">
+          <svg class="add-hero-art" viewBox="0 0 76 76" fill="none" aria-hidden="true">
+            <circle class="soft" cx="38" cy="38" r="36"/>
+            <path d="M18 38 38 21l20 17" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M23 35v20a2 2 0 0 0 2 2h9V45h8v12h9a2 2 0 0 0 2-2V35" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+            <circle cx="56" cy="20" r="10" fill="currentColor"/>
+            <path d="M56 15v10M51 20h10" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/>
+          </svg>
+          <div class="add-hero-body">
+            <h2 class="add-hero-title" data-i18n="add.lead">E'loningiz 3 qadamda joylanadi</h2>
+            <p class="add-hero-text" data-i18n="add.note">Faqat Chirchiq shahri bo'yicha e'lonlar qabul qilinadi</p>
+          </div>
+        </div>
+        <ol class="steps">
+          <li class="step">
+            <span class="step-num" aria-hidden="true">1</span>
+            <div class="step-body">
+              <div class="step-title" data-i18n="add.step1_title">Botni oching</div>
+              <div class="step-text" data-i18n="add.step1_text">Pastdagi tugma sizni botga olib o'tadi</div>
+            </div>
+          </li>
+          <li class="step">
+            <span class="step-num" aria-hidden="true">2</span>
+            <div class="step-body">
+              <div class="step-title" data-i18n="add.step2_title">Ma'lumotlarni kiriting</div>
+              <div class="step-text" data-i18n="add.step2_text">Tur, xonalar, narx, manzil va rasmlar</div>
+            </div>
+          </li>
+          <li class="step">
+            <span class="step-num" aria-hidden="true">3</span>
+            <div class="step-body">
+              <div class="step-title" data-i18n="add.step3_title">Tekshiruvni kuting</div>
+              <div class="step-text" data-i18n="add.step3_text">Tasdiqlangach e'lon katalogda paydo bo'ladi</div>
+            </div>
+          </li>
+        </ol>
+        <a id="add-btn" class="btn btn-lg btn-block" href="https://t.me/Chirchiq_Arenda_bot?start=add">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          <span data-i18n="add.button">E'lon berish</span>
+        </a>
+        <p class="add-foot" data-i18n="add.foot">Tugma botdagi e'lon qo'shish bo'limini ochadi</p>
+      </div>
+    </section>
+
+    <!-- ===== Profile ===== -->
+    <section id="view-profile" class="view" data-view="profile" hidden>
+      <header class="topbar topbar-simple">
+        <div class="topbar-row">
+          <h1 class="page-title" data-i18n="profile.title">Profil</h1>
           <button type="button" class="icon-btn" id="my-refresh" aria-label="Yangilash" title="Yangilash" data-i18n-aria="my.refresh" data-i18n-title="my.refresh">
-            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M17.65 6.35A7.96 7.96 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
           </button>
         </div>
       </header>
-      <div class="list" id="my-list"></div>
+      <div id="profile-card" class="profile-wrap"></div>
+      <div class="lang-block">
+        <span class="section-label" data-i18n="profile.language">Til</span>
+        <div class="lang-switch seg" id="lang-switch" role="group" aria-label="Til" data-i18n-aria="profile.language">
+          <button type="button" class="lang-btn seg-opt" data-lang="uz" aria-pressed="false">UZ</button>
+          <button type="button" class="lang-btn seg-opt" data-lang="ru" aria-pressed="false">RU</button>
+          <button type="button" class="lang-btn seg-opt" data-lang="en" aria-pressed="false">EN</button>
+        </div>
+      </div>
+      <div id="my-section" class="my-section" hidden>
+        <h2 class="section-title" data-i18n="my.title">Mening e'lonlarim</h2>
+        <div class="my-list" id="my-list"></div>
+      </div>
+      <div class="profile-foot">
+        <a id="bot-link" class="btn btn-secondary btn-block" href="https://t.me/Chirchiq_Arenda_bot">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 2-11 13"/><path d="m22 2-7 20-4-9-9-4z"/></svg>
+          <span data-i18n="profile.open_bot">Botni ochish</span>
+        </a>
+      </div>
     </section>
 
     <!-- ===== Tab bar ===== -->
     <nav class="tabbar" id="tabbar" aria-label="Bo'limlar" data-i18n-aria="tabs.label">
       <button type="button" class="tab is-active" data-tab="catalog" aria-selected="true">
-        <span class="tab-icon" aria-hidden="true">🏠</span>
-        <span class="tab-label" data-i18n="tabs.catalog">E'lonlar</span>
+        <span class="tab-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V9.5"/></svg>
+        </span>
+        <span class="tab-label" data-i18n="tabs.catalog">Uylar</span>
       </button>
-      <button type="button" class="tab" data-tab="my" aria-selected="false">
-        <span class="tab-icon" aria-hidden="true">📋</span>
-        <span class="tab-label" data-i18n="tabs.my">Mening e'lonlarim</span>
+      <button type="button" class="tab" data-tab="favs" aria-selected="false">
+        <span class="tab-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+        </span>
+        <span class="tab-label" data-i18n="tabs.favs">Sevimlilar</span>
+      </button>
+      <button type="button" class="tab tab-add" data-tab="add" aria-selected="false">
+        <span class="tab-add-circle" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+        </span>
+        <span class="tab-label" data-i18n="tabs.add">E'lon berish</span>
+      </button>
+      <button type="button" class="tab" data-tab="profile" aria-selected="false">
+        <span class="tab-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+        </span>
+        <span class="tab-label" data-i18n="tabs.profile">Profil</span>
       </button>
     </nav>
   </div>
@@ -70,7 +190,10 @@
   <!-- ===== Detail overlay ===== -->
   <div id="detail" class="detail" role="dialog" aria-modal="true" aria-label="E'lon" data-i18n-aria="detail.label" hidden>
     <button type="button" class="detail-close icon-btn" id="detail-close" aria-label="Yopish" data-i18n-aria="common.close">
-      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5"/><path d="m12 19-7-7 7-7"/></svg>
+    </button>
+    <button type="button" class="detail-fav icon-btn fav-btn" id="detail-fav" aria-pressed="false" aria-label="Sevimlilarga qo'shish" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
     </button>
     <div class="detail-scroll" id="detail-scroll"></div>
     <div class="detail-bar" id="detail-bar"></div>
@@ -79,12 +202,12 @@
   <!-- ===== Bottom sheet ===== -->
   <div id="sheet" class="sheet" hidden>
     <div class="sheet-backdrop" id="sheet-backdrop"></div>
-    <div class="sheet-panel" role="dialog" aria-modal="true" id="sheet-panel">
+    <div class="sheet-panel" role="dialog" aria-modal="true" id="sheet-panel" aria-labelledby="sheet-title">
       <div class="sheet-handle" aria-hidden="true"></div>
       <div class="sheet-head">
         <h2 class="sheet-title" id="sheet-title"></h2>
         <button type="button" class="icon-btn" id="sheet-close" aria-label="Yopish" data-i18n-aria="common.close">
-          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M18.3 5.71 12 12l6.3 6.29-1.41 1.42L10.59 13.4 4.29 19.71 2.88 18.3 9.17 12 2.88 5.71 4.29 4.29l6.3 6.3 6.3-6.3z"/></svg>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
         </button>
       </div>
       <div class="sheet-body" id="sheet-body"></div>

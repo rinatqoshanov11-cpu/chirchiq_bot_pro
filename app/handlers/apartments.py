@@ -10,10 +10,11 @@ import math
 
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.states import ApartmentStates
+from app.states import ApartmentStates, ImportStates
 from app.services import UserService, ApartmentService
 from app.keyboards import MainKeyboard, ApartmentKeyboard, InlineKeyboards
 from app.models.apartment import ApartmentType
@@ -182,6 +183,73 @@ async def _ask_photos(message: Message, state: FSMContext, lang: str = DEFAULT_L
     await state.set_state(ApartmentStates.waiting_for_photos)
 
 
+# ---------------------------------------------------------------------------
+# Admin "forward import" mode (app/handlers/import_listing.py fills the FSM, then
+# only the REQUIRED fields the parser could not find are asked here)
+# ---------------------------------------------------------------------------
+
+def _import_in_progress(data: dict) -> bool:
+    """True while an imported listing still has required fields to fill."""
+    return bool(data.get('import_mode')) and not data.get('import_complete')
+
+
+def _import_price_ok(data: dict) -> bool:
+    """A parsed price counts only when it fits the limits of the (now known) type."""
+    price = data.get('price')
+    if price is None:
+        return False
+    limits = PRICE_LIMITS.get((_type_key(data), data.get('currency') or 'UZS'))
+    if not limits:
+        return False
+    low, high = limits
+    return low <= price <= high
+
+
+async def _ask_import_phone(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
+    """Import mode: contact phone not found in the post -> admin's own number as a one-tap button."""
+    data = await state.get_data()
+    builder = ReplyKeyboardBuilder()
+    admin_phone = data.get('admin_phone')
+    if admin_phone:
+        builder.button(text=str(admin_phone))
+    builder.button(text="📱 Kontaktimni yuborish", request_contact=True)
+    builder.button(text=t("uz", "btn.cancel"))
+    builder.adjust(1)
+    await message.answer(
+        "📞 <b>Telefon raqami topilmadi.</b>\n\n"
+        "E'lon uchun aloqa raqamini yozing (masalan, +998901234567) "
+        "yoki pastdagi tugma bilan o'z raqamingizni tanlang:",
+        reply_markup=builder.as_markup(resize_keyboard=True)
+    )
+    await state.set_state(ImportStates.waiting_for_phone)
+
+
+async def _import_next_missing(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
+    """Ask the first REQUIRED field the parser did not find; when none is missing -> preview.
+
+    Order: type -> rooms -> address -> price -> phone -> photos.
+    """
+    data = await state.get_data()
+    if not data.get('type'):
+        await _ask_type(message, state, lang)
+    elif not data.get('rooms'):
+        await _ask_rooms(message, state, lang)
+    elif not data.get('address'):
+        await _ask_address(message, state, lang)
+    elif not _import_price_ok(data):
+        if data.get('price') is not None:
+            await message.answer("⚠️ Topilgan narx tanlangan tur uchun mos emas, qaytadan kiriting.")
+            await state.update_data(price=None)
+        await _ask_price(message, state, lang)
+    elif not data.get('phone_number'):
+        await _ask_import_phone(message, state, lang)
+    elif not data.get('photos'):
+        await _ask_photos(message, state, lang)
+    else:
+        await state.update_data(import_complete=True, editing=False)
+        await _show_preview(message, state, lang)
+
+
 async def _show_preview(message: Message, state: FSMContext, lang: str = DEFAULT_LANG):
     """Show how the listing will look, with ✅ / ✏️ / ❌ buttons."""
     data = await state.get_data()
@@ -228,6 +296,10 @@ async def _show_preview(message: Message, state: FSMContext, lang: str = DEFAULT
 async def _next_or_preview(message: Message, state: FSMContext, next_step, lang: str = DEFAULT_LANG):
     """After a field is saved: in edit mode go back to the preview, otherwise continue."""
     data = await state.get_data()
+    if data.get('editing') and _import_in_progress(data):
+        # Import mode: keep asking only the required fields that are still missing
+        await _import_next_missing(message, state, lang)
+        return
     if data.get('editing'):
         await state.update_data(editing=False, photos_backup=None, type_backup=None, floor_backup=None, address_backup=None)
         await message.answer(t(lang, "listing.changed"))
@@ -241,6 +313,13 @@ async def _handle_cancel(message: Message, state: FSMContext, lang: str = DEFAUL
     if not is_text(message.text, "btn.cancel"):
         return False
     data = await state.get_data()
+    if _import_in_progress(data):
+        await state.clear()
+        await message.answer(
+            "❌ Import bekor qilindi.",
+            reply_markup=MainKeyboard.get_main_menu(is_registered=True, lang=lang)
+        )
+        return True
     if data.get('editing'):
         restore = {'editing': False}
         if data.get('photos_backup') is not None:
@@ -314,7 +393,7 @@ async def process_apartment_type(message: Message, state: FSMContext, lang: str 
     old_type = _type_key(data) if data.get('type') else None
 
     # Type changed while editing and a price exists -> the price must be re-entered
-    if data.get('editing') and data.get('price') and old_type != apartment_type.value:
+    if data.get('editing') and data.get('price') and old_type and old_type != apartment_type.value:
         await state.update_data(type=apartment_type, type_backup=data.get('type'))
         await message.answer(t(lang, "listing.type_changed"))
         await _ask_price(message, state, lang)
@@ -657,6 +736,9 @@ async def photos_done(message: Message, state: FSMContext, lang: str = DEFAULT_L
         return
 
     await state.update_data(editing=False, photos_backup=None, type_backup=None, floor_backup=None, address_backup=None)
+    if data.get('import_mode'):
+        # Photos are the last required field in import mode -> the import is complete
+        await state.update_data(import_complete=True)
     await _show_preview(message, state, lang)
 
 
@@ -695,6 +777,7 @@ async def confirm_apartment(message: Message, state: FSMContext, session: AsyncS
         return
 
     data = await state.get_data()
+    import_mode = bool(data.get('import_mode'))
     # Leave the confirm state BEFORE saving, so a quick second tap can't save twice
     await state.set_state(None)
 
@@ -715,14 +798,31 @@ async def confirm_apartment(message: Message, state: FSMContext, session: AsyncS
             total_floors=data.get('total_floors'),
             description=data.get('description'),
             photos=data.get('photos', []),
-            source='manual'
+            source='import' if import_mode else 'manual'
         )
+
+        if import_mode:
+            # The admin posted it -> published at once, no admin notification
+            await ApartmentService.approve_apartment(session, apartment)
 
         await state.clear()
 
         is_rent = apartment.type == ApartmentType.RENT
         type_text = t(lang, "listing.success_type_rent" if is_rent else "listing.success_type_sale")
         price_text = _price_text(apartment.price, apartment.currency, "rent" if is_rent else "sale", lang)
+
+        if import_mode:
+            uz_type = "🔑 Ijaraga" if is_rent else "💰 Sotiladi"
+            uz_price = _price_text(apartment.price, apartment.currency, "rent" if is_rent else "sale", "uz")
+            await message.answer(
+                f"✅ <b>Import qilingan e'lon #{apartment.id} darhol e'lon qilindi.</b>\n\n"
+                f"{uz_type} · {apartment.rooms} xonali\n"
+                f"💵 {uz_price}\n"
+                f"📍 {html.escape(truncate_text(apartment.address, 150))}",
+                reply_markup=MainKeyboard.get_main_menu(is_registered=True, lang=lang)
+            )
+            logger.info(f"Imported apartment approved: #{apartment.id} by admin user {data['owner_id']}")
+            return
 
         await message.answer(
             t(lang, "listing.success",

@@ -29,3 +29,9 @@ class AdminStates(StatesGroup):
     """Admin flow states."""
     waiting_for_broadcast_message = State()
     waiting_for_user_search = State()
+
+
+class ImportStates(StatesGroup):
+    """Admin 'forward import' flow: a forwarded/pasted post -> parsed listing."""
+    waiting_for_post = State()
+    waiting_for_phone = State()

@@ -1,8 +1,10 @@
 """Registration handlers (and the /start welcome)."""
 from html import escape
 
+from typing import Optional
+
 from aiogram import Bot, Router, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, ReplyKeyboardRemove, User as TgUser
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -75,9 +77,30 @@ async def send_welcome(bot: Bot, chat_id: int, from_user: TgUser, session: Async
 
 
 @router.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext, session: AsyncSession, bot: Bot, lang: str = "uz"):
-    """Handle /start command."""
+async def cmd_start(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    bot: Bot,
+    command: Optional[CommandObject] = None,
+    lang: str = "uz",
+):
+    """Handle /start command.
+
+    Deep link ``https://t.me/<bot>?start=add`` (the mini app's "E'lon berish" tab) arrives
+    as ``/start add``: it opens the add-listing flow instead of the welcome. The language
+    picker (app/handlers/language.py) still runs first for users without a language.
+    """
     await state.clear()
+    args = (command.args or "").strip().lower() if command is not None else ""
+    if args == "add":
+        try:
+            from app.handlers.apartments import start_add_apartment
+        except ImportError as e:  # pragma: no cover - defensive
+            logger.error(f"/start add: add-listing flow unavailable: {e}")
+        else:
+            await start_add_apartment(message, state, session, lang)
+            return
     await send_welcome(bot, message.chat.id, message.from_user, session, lang)
 
 

@@ -69,6 +69,7 @@ def admin_commands(lang: str = "uz") -> list[BotCommand]:
     # The admin panel itself stays Uzbek; its command label is the same everywhere.
     return user_commands(lang) + [
         BotCommand(command="admin", description="Admin panel"),
+        BotCommand(command="import", description="E'lonni forward orqali qo'shish"),
     ]
 
 

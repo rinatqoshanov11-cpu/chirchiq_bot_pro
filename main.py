@@ -14,6 +14,7 @@ from app.handlers import (
     common_router,
     apartments_router,
     admin_router,
+    import_router,
     fallback_router
 )
 from app.middlewares import DatabaseMiddleware, LanguageMiddleware, LoggingMiddleware
@@ -74,6 +75,7 @@ async def main():
     dp.include_router(common_router)
     dp.include_router(apartments_router)
     dp.include_router(admin_router)
+    dp.include_router(import_router)  # admin: forwarded post -> listing (before fallback)
     dp.include_router(fallback_router)  # must stay last
 
     # Setup startup/shutdown handlers

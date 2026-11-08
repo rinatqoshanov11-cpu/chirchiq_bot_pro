@@ -4,6 +4,7 @@ from .registration import router as registration_router
 from .common import router as common_router
 from .apartments import router as apartments_router
 from .admin import router as admin_router
+from .import_listing import router as import_router
 from .fallback import router as fallback_router
 
 __all__ = [
@@ -12,5 +13,6 @@ __all__ = [
     "common_router",
     "apartments_router",
     "admin_router",
+    "import_router",
     "fallback_router",
 ]
