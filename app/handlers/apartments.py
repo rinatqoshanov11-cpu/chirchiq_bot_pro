@@ -173,7 +173,19 @@ async def _purge(bot: Bot, chat_id: int, state: FSMContext, keep: Iterable[int] 
         update['lf_sticky'] = []
     await state.update_data(**update)
     if doomed:
-        await _delete_ids(bot, chat_id, doomed)
+        # Delete in the background: the next step is sent right away instead of waiting
+        # for Telegram to confirm the deletions (this was the visible delay per step).
+        _run_in_background(_delete_ids(bot, chat_id, doomed))
+
+
+# Strong references so background deletions are not garbage-collected mid-flight
+_BACKGROUND_TASKS: set = set()
+
+
+def _run_in_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
 
 
 async def _say(message: Message, state: FSMContext, text: str, **kwargs) -> Message:

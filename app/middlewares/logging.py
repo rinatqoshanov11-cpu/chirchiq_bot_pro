@@ -1,4 +1,5 @@
 """Logging middleware for aiogram."""
+import time
 from typing import Callable, Dict, Any, Awaitable
 from aiogram import BaseMiddleware
 from aiogram.types import Message, CallbackQuery, TelegramObject
@@ -8,6 +9,18 @@ from app.services import UserService
 from app.utils import get_logger
 
 logger = get_logger(__name__)
+
+_ACTIVITY_INTERVAL = 300  # seconds
+_last_activity_write: Dict[int, float] = {}
+
+
+def _activity_due(telegram_id: int) -> bool:
+    """True if this user's last_activity was not written in the last 5 minutes (in this process)."""
+    now = time.monotonic()
+    if now - _last_activity_write.get(telegram_id, 0.0) < _ACTIVITY_INTERVAL:
+        return False
+    _last_activity_write[telegram_id] = now
+    return True
 
 
 class LoggingMiddleware(BaseMiddleware):
@@ -36,8 +49,9 @@ class LoggingMiddleware(BaseMiddleware):
                 f"{event.data}"
             )
 
-        # Update user's last activity
-        if user and session:
+        # Update user's last activity — at most once per 5 minutes per user, so every tap
+        # doesn't wait for two database round trips
+        if user and session and _activity_due(user.id):
             try:
                 db_user = await UserService.get_by_telegram_id(session, user.id)
                 if db_user:
